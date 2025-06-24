@@ -7,14 +7,26 @@ headers = {
     "Authorization": f"Bearer {os.environ['HF_TOKEN']}",
 }
 
-def query(payload):
-    response = requests.post(API_URL, headers=headers, json=payload)
-    try:
-        return response.json()
-    except Exception as e:
-        print("Error parsing response:", e)
-        print(response.text)
-        return {}
+import time
+
+def safe_query(payload, retries=3, delay=10):
+    for i in range(retries):
+        response = requests.post(API_URL, headers=headers, json=payload)
+        if response.status_code == 200:
+            try:
+                return response.json()
+            except Exception as e:
+                print("Error parsing response:", e)
+                print(response.text)
+                return {}
+        elif response.status_code == 504:
+            print(f"504 Gateway Timeout. Retrying in {delay} sec...")
+            time.sleep(delay)
+        else:
+            print(f"Unexpected error: {response.status_code}")
+            print(response.text)
+            return {}
+    return {"error": "Failed after retries"}
 
 def split_text(text, max_chars=8000):
     chunks = []
@@ -57,7 +69,7 @@ Please format the response using markdown and follow these guidelines:
     with open(input_file, "r", encoding="utf-8") as f:
         content = f.read()
 
-    chunks = split_text(content, max_chars=8000)
+    chunks = split_text(content, max_chars=10000)
 
     all_results = []
     start_time = time.time()
@@ -75,7 +87,7 @@ Please format the response using markdown and follow these guidelines:
             ]
         }
 
-        response = query(payload)
+        response = safe_query(payload)
         if "choices" in response:
             message = response["choices"][0]["message"]["content"]
             all_results.append(f"\n## Chunk {i+1}\n{message}")
