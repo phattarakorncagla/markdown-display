@@ -1,0 +1,560 @@
+
+## Chunk 1
+# iPhone App Notification - Specification Document
+
+## Overview
+
+This document outlines the specification for the iPhone App Notification project. This project focuses on integrating with DocuSign to handle notifications related to document signing and other account activities. The backend server provides endpoints for authentication, retrieving user information, and managing notifications.
+
+## Data Model
+
+The project utilizes the following entities:
+
+*   **User:** Represents a user of the application.
+*   **Application:** Represents an application within the system.
+*   **Notification:** Represents a notification for a user.
+*   **User\_Application:** Represents the relationship between users and applications.
+
+## API Endpoints
+
+### 1. Authentication (`/auth`)
+
+This endpoint handles the authentication process using DocuSign's OAuth 2.0 protocol.
+
+**HTTP Method:** `GET`
+
+**Description:** Initiates the DocuSign OAuth 2.0 login flow. Redirects the user to DocuSign for authentication.
+
+**Request Parameters:**
+
+*   `appId` (required): The ID of the application within the system (currently hardcoded to `docusignId`).
+*   `device-token` (required): A unique identifier for the device attempting to authenticate.
+
+**Response:**
+
+*   Redirects the user to the DocuSign authorization URL.
+
+**Example:**
+
+```
+GET /auth?appId=1&device-token=some_device_token
+```
+
+### 2. DocuSign Login Success (`/auth/docusign/success`)
+
+This endpoint handles the response from DocuSign after successful authentication.
+
+**HTTP Method:** `GET`
+
+**Description:** Processes the authorization code received from DocuSign, exchanges it for an access token, and retrieves user information and envelopes.
+
+**Request Parameters:**
+
+*   `code` (required): The authorization code received from DocuSign.
+*   `state` (required): The device token received from the login request.
+
+**Response:**
+
+*   Returns user information and a list of envelopes from DocuSign.
+*   Creates or updates notifications based on the retrieved information.
+
+**Example:**
+
+```
+GET /auth/docusign/success?code=some_auth_code&state=some_device_token
+```
+
+### 3. Application Listing (`/api/apps`)
+
+This endpoint retrieves a list of available applications.
+
+**HTTP Method:** `GET`
+
+**Description:** Retrieves all applications from the database.
+
+**Request Parameters:** None
+
+**Response:**
+
+*   A JSON array containing application objects.
+
+**Example:**
+
+```
+GET /api/apps
+```
+
+**Response Body:**
+
+```json
+[
+  {
+    "id": 1,
+    "app_name": "Docusign"
+  }
+]
+```
+
+### 4. User Application Listing (`/api/users/:userId/applications`)
+
+This endpoint retrieves a list of applications associated with a specific user.
+
+**HTTP Method:** `GET`
+
+**Description:** Retrieves all applications associated with a given user.
+
+**Request Parameters:**
+
+*   `userId` (required): The ID of the user.
+
+**Response:**
+
+*   A JSON array containing application objects.
+
+**Example:**
+
+```
+GET /api/users/1/applications
+```
+
+## Technologies Used
+
+*   **Node.js:** The runtime environment.
+*   **Express.js:** Web application framework.
+*   **TypeORM:** Object-Relational Mapper (ORM) for database interactions.
+*   **SQLite:** Database.
+*   **dotenv:** For managing environment variables.
+*   **crypto:** For generating secure tokens.
+*   **fetch:** For making HTTP requests to DocuSign.
+
+## Security Considerations
+
+*   **Environment Variables:** Sensitive information like API keys and secrets are stored in environment variables.
+*   **HTTPS:**  Production environments should use HTTPS to encrypt communication.
+*   **Session Management:** Secure session management is implemented using `express-session`.
+*   **PKCE:** Proof Key for Code Exchange (PKCE) is used to enhance the security of the OAuth 2.0 flow.
+*   **Data Validation:** Input data should be validated to prevent injection attacks.
+
+## Future Enhancements
+
+*   Implement more robust error handling and logging.
+*   Add support for other notification types.
+*   Implement user roles and permissions.
+*   Add API documentation using tools like Swagger.
+
+
+## Chunk 2
+Okay, I've reviewed the provided code snippets. Here's a breakdown of what each file does, potential areas for improvement, and some general observations.
+
+**1. `private-server/src/api/controllers/authController.ts` (Login Controller)**
+
+*   **Purpose:** Handles user login using Docusign OAuth.
+*   **Workflow:**
+    1.  Receives an access token.
+    2.  Fetches user information and Docusign envelopes using the access token.
+    3.  Creates or updates notifications based on the envelopes.
+    4.  Updates the user's application information.
+    5.  Returns the user data and a success message.
+    6.  Handles errors and returns an error message.
+*   **Key Functions:**
+    *   `authLogin`: The main login endpoint.
+    *   `getDocusignUserInfoAndEnvelopes`: Fetches user info and envelopes from Docusign.
+    *   `createOrUpdateNotifcationFromEnvelopes`: Creates or updates notifications based on Docusign envelopes.
+    *   `updateUserApplication`: Updates the user's application information.
+    *   `flattenEnvelopes`: Helper function to flatten the Docusign envelope structure.
+*   **Potential Improvements:**
+    *   **Error Handling:** The error handling could be more specific.  Instead of a generic 500 error, consider returning more informative error codes and messages based on the type of error (e.g., authentication failure, Docusign API error, database error).
+    *   **Asynchronous Operations:** The code uses `async/await` effectively, which is good.
+    *   **Data Validation:**  Consider adding more robust data validation for the incoming request body (e.g., checking for required fields, validating email format).
+    *   **Logging:** Add more detailed logging to help with debugging. Log important events like successful logins, errors during Docusign API calls, and notification creation/updates.
+    *   **Security:**  Ensure the access token is handled securely.  Avoid logging the token directly.
+    *   **`docusignId`:** The `docusignId` variable is used in `createOrUpdateNotifcationFromEnvelopes` but isn't defined in the provided code.  Make sure this is properly initialized and available.
+    *   **`TRUE_VALUE` and `FALSE_VALUE`:** These constants are used in `createOrUpdateNotifcationFromEnvelopes` but aren't defined.  Define them for clarity.
+    *   **`splitSubject`:** The `splitSubject` logic in `createOrUpdateNotifcationFromEnvelopes` might need refinement.  It assumes the subject is always in the format "Subject: Message".  Consider a more robust parsing method.
+
+**2. `private-server/src/api/controllers/deviceController.ts` (Device Controller)**
+
+*   **Purpose:** Handles user creation and updates related to device tokens.
+*   **Workflow:**
+    1.  `create`: Creates a new user if they don't exist, or returns a 400 error if the user already exists.
+    2.  `update`: Updates the user's device token and email.
+*   **Key Functions:**
+    *   `create`: Creates a new user with a device token.
+    *   `update`: Updates an existing user's device token and email.
+*   **Potential Improvements:**
+    *   **Input Validation:** Validate the `deviceToken` and `email` inputs.
+    *   **Error Handling:**  More specific error handling.
+    *   **Encryption:** The code uses `hash` from `utils/encryption`. Ensure this is a strong hashing algorithm (e.g., bcrypt) and that the salt is managed correctly.
+    *   **User Existence Check:** The check for existing users is simple. Consider adding more checks to ensure the device token is valid.
+    *   **Email Encryption:**  The code encrypts the email using `hash`.  This is a good practice for security.
+    *   **Data Sanitization:** Sanitize the input data to prevent potential security vulnerabilities (e.g., XSS).
+
+**3. `private-server/src/api/controllers/notificationController.ts` (Notification Controller)**
+
+*   **Purpose:**  Provides an interface for managing notifications.
+*   **Workflow:**  This file currently only defines the repository for notifications.  It's likely that the actual notification logic is handled in the `notificationService` file.
+*   **Key Function:**
+    *   `notificationRepository`:  Defines the repository for the `Notification` entity.
+*   **Potential Improvements:**
+    *   **Methods:** Add methods to the repository to handle common notification operations (e.g., create, findByUserIdAndAppId, update).
+    *   **Data Validation:**  Validate the data being saved to the database.
+
+**General Observations:**
+
+*   **Dependency Injection:** The code uses dependency injection effectively, which makes it easier to test and maintain.
+*   **Data Models:** The code uses data models (`User`, `CreateRequest`, `UpdateRequest`, `Notification`, etc.), which is good practice.
+*   **Error Handling:**  While `try...catch` blocks are used, the error handling could be more robust and informative.
+*   **Security:**  Pay close attention to security best practices, especially when handling sensitive data like passwords and access tokens.
+*   **Constants:** Define constants for values like `TRUE_VALUE` and `FALSE_VALUE` to improve readability and maintainability.
+*   **Logging:** Implement comprehensive logging to aid in debugging and monitoring.
+
+**Recommendations:**
+
+1.  **Implement more specific error handling.**  Provide more informative error messages to the client.
+2.  **Add input validation** to all API endpoints.
+3.  **Enhance security** by using strong hashing algorithms and properly managing access tokens.
+4.  **Add logging** to track important events.
+5.  **Define constants** for values like `TRUE_VALUE` and `FALSE_VALUE`.
+6.  **Refine the `splitSubject` logic** in `createOrUpdateNotifcationFromEnvelopes`.
+7.  **Implement methods in the `notificationRepository`** to encapsulate common notification operations.
+
+This detailed analysis should help you identify areas for improvement and ensure the security and reliability of your application.  Let me know if you have any other questions.
+
+## Chunk 3
+Okay, I've reviewed the provided code snippets. Here's a breakdown of the code, potential improvements, and considerations.
+
+**Overall Structure**
+
+The code defines a set of API controllers for managing user applications.  It's well-structured, separating concerns into different controller functions for different operations (create, find, update).  It uses `express` for the API framework and likely an ORM (like TypeORM, based on the entity definitions) for database interactions.
+
+**Key Observations and Potential Improvements**
+
+1. **Error Handling:** The `try...catch` blocks are good for basic error handling, but they currently just send a generic error message with the error's message.  In a production environment, you'd want to:
+   - Log the error details (using a logging library like Winston or Pino).
+   - Return more specific error codes (e.g., 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, 500 Internal Server Error).
+   - Consider using a consistent error response format (e.g., a JSON object with `code`, `message`, and optionally `details`).
+
+2. **Input Validation:**  The code performs some basic input validation (checking for required fields).  However, it could be more robust:
+   - **Data Type Validation:**  Ensure that `userId` and `appId` are actually numbers.  The `Number()` conversion can fail.  Use `typeof` or a more specific validation library.
+   - **Range Validation:**  If `numOfUnsignedNotif` has a valid range, validate that the input falls within that range.
+   - **Format Validation:**  Validate the format of email addresses (if applicable).
+   - **Sanitization:** Sanitize user inputs to prevent injection attacks (e.g., XSS, SQL injection).
+
+3. **Security:**
+   - **Authentication/Authorization:**  The code doesn't include any authentication or authorization checks.  You'll need to add middleware to verify the user's identity and ensure they have the necessary permissions to perform the requested action.
+   - **Password Hashing:** The `utils/encryption.ts` file contains a `hash` function.  Make sure this is using a strong hashing algorithm (like bcrypt or Argon2) and salting to protect passwords.
+   - **Input Validation (again):**  Input validation is a crucial security measure.  It helps prevent malicious data from being injected into your application.
+
+4. **Data Access:**
+   - **Repository Pattern:** The code uses repositories (`userRepository`, `appRepository`, `userAppRepository`). This is a good practice for separating data access logic from the controller logic.
+   - **Service Layer:** The code relies on service functions (`userService`, `applicationService`, `userApplicationService`). This is also a good practice for separating business logic from the controller logic.
+   - **Database Connection:** The code uses `ServerDB.getRepository()`.  Ensure that `ServerDB` is properly configured and handles database connection pooling and error handling.
+
+5. **Code Duplication:** There's some code duplication in the `update` function (checking for `id` and `isRead`/`isSigned`).  You could refactor this into a helper function or use a more concise syntax.
+
+6. **Type Safety:** The code uses TypeScript, which is great.  Ensure that your type definitions are accurate and comprehensive.
+
+7. **Naming Conventions:** The naming conventions are generally good.
+
+**Specific Code Review**
+
+* **`create` (userApplicationController.ts):**
+    * The check `numOfUnsignedNotif == null` is not ideal. It's better to use `numOfUnsignedNotif === null` or `numOfUnsignedNotif == undefined` to explicitly check for null or undefined values.
+    * The error message when the application is already added is a bit verbose.  Consider a more concise message.
+* **`findByUserId` (userApplicationController.ts):**
+    * The function name is a bit generic.  Consider renaming it to something more specific, like `getUserApplications`.
+* **`findByEmailAndAppId` (userApplicationController.ts):**
+    * The function name is good.
+    * The use of `hash(email)` is good for security.
+* **`findByUserIdAndAppId` (userApplicationController.ts):**
+    * This function is very similar to the `update` function.  Consider refactoring them to share common logic.
+* **`update` (userApplicationController.ts):**
+    * The code is a bit repetitive.  You could refactor the input validation and data update logic into a helper function.
+
+**Example Improvements (Illustrative)**
+
+```typescript
+// Improved Error Handling (example)
+const create = async (req: Request, res: Response) => {
+  try {
+    // ... (existing code) ...
+    const newUserApplication = new User_Application(
+      application,
+      user,
+      numOfUnsignedNotif,
+      isLoggedIn,
+    );
+    const userApplication = await userApplicationService.create(
+      userAppRepository,
+      newUserApplication,
+    );
+    res.json(userApplication);
+  } catch (error: any) { // Use 'any' or a more specific error type
+    console.error("Error creating user application:", error); // Log the error
+    res.status(500).json({ code: 'INTERNAL_SERVER_ERROR', message: 'Failed to create user application' });
+  }
+};
+
+// Improved Input Validation (example)
+const update = async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const { numOfUnsignedNotif, isLoggedIn } = req.body as UpdateRequest;
+
+    if (!id) {
+      return res.status(400).json({ code: 'BAD_REQUEST', message: 'Missing user application ID' });
+    }
+
+    if (numOfUnsignedNotif !== null && typeof numOfUnsignedNotif !== 'number') {
+      return res.status(400).json({ code: 'BAD_REQUEST', message: 'numOfUnsignedNotif must be a number' });
+    }
+
+    if (isLoggedIn !== null && typeof isLoggedIn !== 'boolean') {
+      return res.status(400).json({ code: 'BAD_REQUEST', message: 'isLoggedIn must be a boolean' });
+    }
+
+    // ... (rest of the code) ...
+  } catch (error: any) {
+    console.error("Error updating user application:", error);
+    res.status(500).json({ code: 'INTERNAL_SERVER_ERROR', message: 'Failed to update user application' });
+  }
+};
+```
+
+**Recommendations**
+
+1. **Implement Authentication and Authorization:**  This is a critical security requirement.
+2. **Add Robust Input Validation:**  Prevent malicious data from being injected into your application.
+3. **Improve Error Handling:**  Log errors and return more informative error responses.
+4. **Refactor Code:**  Reduce code duplication and improve readability.
+5. **Consider a Logging Library:**  Use a logging library to track application events and errors.
+6. **Review Security Best Practices:**  Follow security best practices to protect your application from vulnerabilities.
+
+This detailed review should give you a good starting point for improving the quality and security of your API controllers.  Let me know if you have any more questions.
+
+## Chunk 4
+The provided code snippet shows a well-structured Express.js API for managing users and their applications. Here's a breakdown of the code, potential improvements, and considerations:
+
+**Overall Structure**
+
+*   **Modular Design:** The code is well-organized into separate files for controllers, models, routes, and services. This promotes maintainability and testability.
+*   **Clear Separation of Concerns:** Each file has a specific responsibility, making the codebase easier to understand.
+*   **Type Safety:**  TypeScript is used extensively, which helps catch errors early and improves code readability.
+*   **Consistent Error Handling:**  The `try...catch` blocks in the controllers provide consistent error handling, returning 500 status codes with informative error messages.
+
+**Detailed Analysis and Potential Improvements**
+
+**1. `userController.ts`**
+
+*   **`deleteById`:**  The `deleteById` function is straightforward.  However, it's good practice to add validation to ensure the `id` is a valid number before attempting to delete.  Also, consider adding logging for successful and failed deletions.
+*   **Error Message:** The error message includes `(error as Error).message`.  While this works, it's better to format the error message to be more user-friendly and avoid exposing internal implementation details.  Consider using a consistent error format across all controllers.
+
+**2. `userController.ts` (Other Functions)**
+
+*   **`findAll`, `findOneById`, `findOneByDeviceToken`, `findOneByEmail`, `update`, `deleteById`:** These functions are generally well-written.
+*   **Email Encryption:** The `findOneByEmail` function uses `hash` from `utils/encryption`.  Ensure that the encryption method is secure and appropriate for the application's needs.  Consider using a well-established library like bcrypt or argon2.
+*   **`update`:**  The `update` function retrieves the user by ID *before* attempting to update. This is good practice to prevent updating non-existent users.
+*   **Error Handling:**  Consistent error handling is present.
+
+**3. `authModel.ts`, `notificationModel.ts`, `userApplicationModel.ts`, `userModel.ts`**
+
+*   **Interfaces:** The interfaces are well-defined and provide a clear contract for data structures.
+*   **Consistency:**  The `CreateRequest` and `UpdateRequest` interfaces are used consistently across different models, which is good.
+*   **`userModel.ts`:** The `CreateRequest` for `userModel` has `email?: string | null`.  This allows for users to be created without an email address, which might be a valid use case.
+
+**4. `appRoutes.ts`, `deviceRoutes.ts`, `notificationRoutes.ts`, `routes.ts`, `userApplicationRoutes.ts`, `userRoutes.ts`**
+
+*   **Route Organization:** The routes are well-organized and easy to navigate.
+*   **Middleware:** Consider adding middleware for authentication and authorization to protect sensitive routes.
+*   **Route Parameters:**  The use of route parameters (e.g., `/users/:id`) is appropriate.
+*   **Route Definitions:**  The route definitions are clear and concise.
+
+**5. `userApplicationRoutes.ts`**
+
+*   **`findByEmailAndAppId` and `findByUserIdAndAppId`:** These routes are useful for specific use cases.  Consider adding validation to ensure that both `email` and `appId` are provided.
+*   **`update`:** The `update` route uses the `id` in the URL, which is standard.
+
+**General Recommendations**
+
+*   **Validation:** Implement input validation for all incoming requests to prevent invalid data from being processed.  Libraries like `express-validator` can be helpful.
+*   **Authentication and Authorization:** Implement authentication and authorization to protect sensitive routes and ensure that only authorized users can access certain resources.
+*   **Logging:** Add logging to track API requests, errors, and other important events.  This can be helpful for debugging and monitoring.
+*   **Error Handling:**  Consider a more centralized error handling mechanism.  This could involve creating a custom error class and using a middleware to handle errors consistently.
+*   **Data Sanitization:** Sanitize user input to prevent cross-site scripting (XSS) and other security vulnerabilities.
+*   **Asynchronous Operations:**  Ensure that all asynchronous operations are handled correctly using `async/await` or Promises.
+*   **Environment Variables:**  Store sensitive information (e.g., database credentials, API keys) in environment variables.
+*   **Testing:** Write unit and integration tests to ensure that the API is working correctly.
+*   **API Documentation:**  Use a tool like Swagger or OpenAPI to generate API documentation.
+
+**Example of Improved Error Handling**
+
+```typescript
+// In userController.ts
+const deleteById = async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id);
+
+    if (isNaN(id)) {
+      throw new Error('Invalid user ID. ID must be a number.');
+    }
+
+    await userApplicationService.deleteById(userAppRepository, id);
+    res.send('User application deleted');
+  } catch (error: any) { // Use 'any' for type safety with error messages
+    console.error('Error deleting user application:', error); // Log the error
+    res.status(500).send(`Internal Server Error: ${error.message}`); // More user-friendly message
+  }
+};
+```
+
+**Example of Validation (using express-validator)**
+
+```typescript
+// In routes/userRoutes.ts
+import { body, validationResult } from 'express-validator';
+
+router.post('/create', [
+  body('email').isEmail().notEmpty().withMessage('Email must be a valid email address and not empty'),
+  body('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters long'),
+], (req, res) => {
+  // ... your controller logic ...
+});
+```
+
+**In summary,** the code is a good starting point for a user management API. By implementing the recommendations above, you can improve its security, reliability, and maintainability.  Remember to prioritize security and validation to protect your application from vulnerabilities.
+
+## Chunk 5
+Okay, I've reviewed the provided code and identified a potential issue and some areas for improvement.
+
+**Potential Issue:**
+
+The `appController.test.ts` file mocks the `applicationService` but doesn't provide any test data or setup for the mocked service. This means the tests might not be meaningful or might fail due to the service not being called correctly.  The tests are currently just checking that the service is called, but not that it's called with the correct arguments or that it returns the expected results.
+
+**Improvements and Suggestions:**
+
+1. **Test Data:**  In `appController.test.ts`, you need to create test data for the `Application` entity.  This will allow you to verify that the controller is interacting with the service correctly.
+
+2. **Mocked Service Return Values:**  In your tests, you should mock the return values of the `applicationService` functions to control the results and ensure that the controller behaves as expected under different scenarios.
+
+3. **Test Cases:** Add more test cases to cover different scenarios, such as:
+   - Successful retrieval of an application by ID.
+   - Handling of a non-existent application ID.
+   - Error handling (if applicable).
+
+4. **Request/Response Objects:**  Make sure your `req` and `res` objects in the test setup are properly configured to simulate real HTTP requests and responses.
+
+5. **Clearer Assertions:** Use more specific assertions to verify the data returned by the controller.
+
+**Here's an updated `appController.test.ts` with some of these improvements:**
+
+```typescript
+import { describe, expect, test } from '@jest/globals';
+import appController from '../controllers/appController';
+import { Request, Response } from 'express';
+import applicationService from '../services/applicationService';
+import { Application } from '../../entity/Application';
+
+jest.mock('../services/applicationService');
+
+describe('appController tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+  let mockFindAll: jest.Mock;
+  let mockFindOneById: jest.Mock;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {} as Partial<Request>;
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    } as Partial<Response>;
+
+    // Mock the applicationService functions
+    mockFindAll = applicationService.findAll as jest.Mock;
+    mockFindOneById = applicationService.findOneById as jest.Mock;
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('findAll should call applicationService.findAll and send the results', async () => {
+    const mockApplications: Application[] = [
+      { id: 1, name: 'App 1' },
+      { id: 2, name: 'App 2' },
+    ];
+    mockFindAll.mockResolvedValue(mockApplications);
+
+    await appController.findAll(req, res);
+
+    expect(mockFindAll).toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith(mockApplications);
+  });
+
+  test('findOneById should call applicationService.findOneById and send the results', async () => {
+    const mockApplication: Application = { id: 1, name: 'App 1' };
+    mockFindOneById.mockResolvedValue(mockApplication);
+
+    await appController.findOneById(req, res, 1);
+
+    expect(mockFindOneById).toHaveBeenCalledWith(1);
+    expect(res.json).toHaveBeenCalledWith(mockApplication);
+  });
+
+  // Add more test cases for other routes (findByDeviceToken, findByEmail, deleteById)
+});
+```
+
+**Explanation of Changes:**
+
+*   **Mocked Service Functions:**  We now explicitly mock `findAll` and `findOneById` from `applicationService` and store them in `mockFindAll` and `mockFindOneById`.
+*   **Test Data:**  We create `mockApplications` and `mockApplication` to provide test data for the mocked service.
+*   **`mockResolvedValue`:** We use `mockResolvedValue` to simulate the return value of the mocked service functions.
+*   **Assertions:** We add assertions to verify that the mocked service functions are called with the correct arguments and that the controller sends the expected results.
+*   **Test Cases:** Added a test case for `findAll` and `findOneById`.  You should add more test cases for the other routes.
+
+**Important Considerations:**
+
+*   **Error Handling:**  You should add test cases to verify that the controller handles errors correctly (e.g., when an application is not found).
+*   **Request Validation:**  If your controller performs request validation, you should add test cases to verify that the validation is working correctly.
+*   **Asynchronous Operations:**  Make sure to use `async/await` in your tests to handle asynchronous operations correctly.
+
+By implementing these improvements, you can create more robust and reliable tests for your controller.  Remember to adapt the test cases to your specific application logic and requirements.
+
+## Chunk 6
+[Error]: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1750896000000'}, 'provider_name': None}}, 'user_id': 'user_2ywgbyxnOhljQyNRQ1aGEDtgvSo'}
+
+## Chunk 7
+[Error]: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1750896000000'}, 'provider_name': None}}, 'user_id': 'user_2ywgbyxnOhljQyNRQ1aGEDtgvSo'}
+
+## Chunk 8
+[Error]: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1750896000000'}, 'provider_name': None}}, 'user_id': 'user_2ywgbyxnOhljQyNRQ1aGEDtgvSo'}
+
+## Chunk 9
+[Error]: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1750896000000'}, 'provider_name': None}}, 'user_id': 'user_2ywgbyxnOhljQyNRQ1aGEDtgvSo'}
+
+## Chunk 10
+[Error]: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1750896000000'}, 'provider_name': None}}, 'user_id': 'user_2ywgbyxnOhljQyNRQ1aGEDtgvSo'}
+
+## Chunk 11
+[Error]: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1750896000000'}, 'provider_name': None}}, 'user_id': 'user_2ywgbyxnOhljQyNRQ1aGEDtgvSo'}
+
+## Chunk 12
+[Error]: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1750896000000'}, 'provider_name': None}}, 'user_id': 'user_2ywgbyxnOhljQyNRQ1aGEDtgvSo'}
+
+## Chunk 13
+[Error]: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1750896000000'}, 'provider_name': None}}, 'user_id': 'user_2ywgbyxnOhljQyNRQ1aGEDtgvSo'}
+
+## Chunk 14
+[Error]: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1750896000000'}, 'provider_name': None}}, 'user_id': 'user_2ywgbyxnOhljQyNRQ1aGEDtgvSo'}
+
+## Chunk 15
+[Error]: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1750896000000'}, 'provider_name': None}}, 'user_id': 'user_2ywgbyxnOhljQyNRQ1aGEDtgvSo'}

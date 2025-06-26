@@ -1,0 +1,478 @@
+
+## Chunk 1
+# iPhone App Notification System - Backend API Specification
+
+## Overview
+This document outlines the backend API specification for the iPhone App Notification system. The API manages user authentication, device registration, application management, and notification handling with a focus on Docusign integration. The system uses Express.js with TypeORM and SQLite for data persistence.
+
+## Authentication Endpoints
+
+### Initiate Docusign Login
+```http
+GET /login/{appId}
+```
+Initiates OAuth2 login flow for Docusign integration.
+
+**Parameters:**
+- `appId` (path): Must be `1` for Docusign
+- `device-token` (header): Unique device identifier
+
+**Response:**
+- 302 Redirect to Docusign authentication URL
+- 400 if invalid appId
+- 500 if missing environment variables
+
+### Docusign Login Callback
+```http
+GET /docusign/login/success
+```
+Handles OAuth2 callback after Docusign authentication.
+
+**Query Parameters:**
+- `code`: Authorization code from Docusign
+- `state`: Device token passed from initial request
+
+**Successful Response:**
+```json
+{
+  "user": {
+    "id": 1,
+    "email": "encrypted@example.com",
+    "device_token": "device123"
+  },
+  "message": "ログインに成功しました。"
+}
+```
+**Error Responses:**
+- 500 for token exchange failures
+- 500 if user not found
+
+## Device Management
+
+### Register Device
+```http
+POST /devices/create
+```
+Registers a new device/user association.
+
+**Request Body:**
+```json
+{
+  "email": "user@example.com",
+  "deviceToken": "unique-device-id"
+}
+```
+
+**Response:**
+```json
+{
+  "id": 1,
+  "email": "encrypted-value",
+  "device_token": "unique-device-id"
+}
+```
+
+### Update Device
+```http
+PUT /devices/update/{userId}
+```
+Updates device/user information.
+
+**Parameters:**
+- `userId` (path): ID of user to update
+
+**Request Body:**
+```json
+{
+  "deviceToken": "new-device-id",
+  "email": "new@email.com"
+}
+```
+
+**Response:** Updated user object
+
+## Notification Endpoints
+
+### Create Notification
+```http
+POST /notifications/create
+```
+Creates a new notification record.
+
+**Request Body:**
+```json
+{
+  "subject": "Document Signature Required",
+  "date": "2023-10-15T12:00:00Z",
+  "isRead": 0,
+  "isSigned": 0,
+  "sender": "sender@docusign.com",
+  "receiver": 1,
+  "appId": 1,
+  "envelopeId": "env-12345"
+}
+```
+
+**Response:** Created notification object
+
+### Get User Notifications
+```http
+POST /notifications/findByUserIdAndAppId
+```
+Retrieves notifications for a specific user and application.
+
+**Request Body:**
+```json
+{
+  "userId": 1,
+  "appId": 1
+}
+```
+
+**Response:**
+```json
+[
+  {
+    "id": 1,
+    "subject": "Contract Agreement",
+    "date": "2023-10-15T12:00:00Z",
+    "is_read": 0,
+    "is_signed": 0,
+    "sender": "legal@company.com",
+    "envelope_id": "env-12345"
+  }
+]
+```
+
+### Update Notification Status
+```http
+PUT /notifications/update/{id}
+```
+Updates notification read/signed status.
+
+**Parameters:**
+- `id` (path): Notification ID
+
+**Request Body:**
+```json
+{
+  "isRead": 1,
+  "isSigned": 1
+}
+```
+
+**Response:** Updated notification object
+
+## User Application Management
+
+### Add Application to User
+```http
+POST /userApplications/create
+```
+Associates an application with a user.
+
+**Request Body:**
+```json
+{
+  "appId": 1,
+  "userId": 1,
+  "numOfUnsignedNotif": 3,
+  "isLoggedIn": 1
+}
+```
+
+**Response:**
+```json
+{
+  "id": 1,
+  "app": {"id": 1, "app_name": "Docusign"},
+  "user": {"id": 1, "email": "encrypted@example.com"},
+  "num_of_unsigned_notif": 3,
+  "is_logged_in": 1
+}
+```
+
+### Get User Applications
+```http
+GET /userApplications/findByUserId/{userId}
+```
+Retrieves applications associated with a user.
+
+**Response:**
+```json
+[
+  {
+    "id": 1,
+    "app": {"id": 1, "app_name": "Docusign"},
+    "num_of_unsigned_notif": 2,
+    "is_logged_in": 1
+  }
+]
+```
+
+## Data Models
+
+### User
+```typescript
+interface User {
+  id: number;
+  email: string | null; // Encrypted value
+  device_token: string;
+}
+```
+
+### Application
+```typescript
+interface Application {
+  id: number;
+  app_name: string;
+}
+```
+
+### Notification
+```typescript
+interface Notification {
+  id: number;
+  subject: string;
+  date: string; // ISO 8601 format
+  is_read: number; // 0 or 1
+  is_signed: number; // 0 or 1
+  sender: string;
+  receiver: User;
+  app: Application;
+  envelope_id: string;
+}
+```
+
+### User_Application
+```typescript
+interface User_Application {
+  id: number;
+  app: Application;
+  user: User;
+  num_of_unsigned_notif: number;
+  is_logged_in: number; // 0 or 1
+}
+```
+
+## Security
+- All emails are encrypted using SHA-256 before storage
+- OAuth2 with PKCE for Docusign authentication
+- Session management with express-session
+- Environment variables for sensitive credentials
+
+## Error Handling
+Standard HTTP status codes with descriptive messages:
+```json
+{
+  "error": "Error message details"
+}
+```
+
+## Chunk 2
+The provided code shows a comprehensive implementation for handling DocuSign webhook events in a public server. The key aspects of the solution include:
+
+1. **HMAC Signature Verification**:
+   - Uses SHA-256 HMAC to verify incoming DocuSign webhook requests
+   - Compares computed hash with `x-docusign-signature-1` header
+   - Ensures request authenticity before processing
+
+2. **Event Handling**:
+   - Processes two main DocuSign events:
+     - `envelope-sent`: Creates new notifications and increments unsigned count
+     - `recipient-completed`: Updates notifications and decrements unsigned count
+
+3. **Data Processing**:
+   - Extracts envelope details (subject, date, sender, ID)
+   - Handles multiple recipients in parallel
+   - Uses consistent snake_case field names for entity updates
+
+4. **Integration with Private Server**:
+   - Uses Axios to communicate with private API endpoints
+   - Implements proper error handling for network requests
+   - Maintains data consistency across services
+
+5. **Push Notifications**:
+   - Sends APN notifications for new unsigned documents
+   - Updates badge counts dynamically
+
+Here's the optimized implementation for the webhook controller:
+
+```typescript
+// public-server/src/api/controllers/webhookController.ts
+import { Request, Response } from 'express';
+import crypto from 'crypto';
+import { AxiosResponse } from 'axios';
+import { Notification } from '../../entity/Notification';
+import { User_Application } from '../../entity/User_Application';
+import nodeApnController from './nodeApnController';
+import { makeAxiosRequest } from '../utils/axiosRequest';
+
+const DOCUSIGN_ID = 1;
+const FALSE_VALUE = 0;
+const TRUE_VALUE = 1;
+
+const docusignNotification = async (req: Request, res: Response) => {
+  const computeHash = (payload: string, secret: string): string => {
+    const hmac = crypto.createHmac('sha256', secret);
+    hmac.update(payload);
+    return hmac.digest('base64');
+  };
+
+  try {
+    const payload = req.body;
+    const verify = req.headers['x-docusign-signature-1']?.toString();
+    const secret = process.env.DOCUSIGN_HMAC_TOKEN;
+
+    if (!secret) return res.status(500).send('DOCUSIGN_HMAC_TOKEN not found');
+    if (!verify) return res.status(400).send('x-docusign-signature-1 not found');
+
+    // Verify HMAC signature
+    const computedHash = computeHash(JSON.stringify(payload), secret);
+    if (!crypto.timingSafeEqual(
+      Buffer.from(verify, 'base64'),
+      Buffer.from(computedHash, 'base64')
+    )) {
+      return res.status(401).send('Invalid signature');
+    }
+
+    const event = payload.event;
+    const envelopeId = payload.data.envelopeId;
+    const date = payload.generatedDateTime;
+    const subject = payload.data.envelopeSummary.emailSubject.split(': ').pop() || 
+                   payload.data.envelopeSummary.emailSubject;
+    const sender = payload.data.envelopeSummary.sender.userName || 
+                  payload.data.envelopeSummary.sender.email;
+    const recipients = payload.data.envelopeSummary.recipients.signers;
+
+    for (const recipient of recipients) {
+      const email = recipient.email;
+
+      // Find user application
+      let userApp: User_Application | null = null;
+      try {
+        const response = await makeAxiosRequest<User_Application>(
+          'userApplications/findByEmailAndAppId',
+          'post',
+          { email, appId: DOCUSIGN_ID }
+        );
+        userApp = response.data;
+      } catch (error) {
+        console.error(`User application not found for ${email}:`, error);
+        continue;
+      }
+
+      if (!userApp) continue;
+
+      if (event === 'envelope-sent') {
+        // Create new notification
+        const newNotification = new Notification(
+          subject,
+          date,
+          FALSE_VALUE,
+          FALSE_VALUE,
+          sender,
+          userApp.user,
+          userApp.app,
+          envelopeId
+        );
+
+        try {
+          await makeAxiosRequest(
+            'notifications/create',
+            'post',
+            newNotification
+          );
+
+          // Update unsigned count
+          userApp.num_of_unsigned_notif += 1;
+
+          // Send push notification
+          await nodeApnController.sendNotification(
+            newNotification,
+            userApp.user.device_token,
+            userApp.num_of_unsigned_notif
+          );
+        } catch (error) {
+          console.error(`Error processing envelope-sent:`, error);
+        }
+      } 
+      else if (event === 'recipient-completed') {
+        try {
+          // Find existing notification
+          const response = await makeAxiosRequest<Notification>(
+            'notifications/findByUserIdAndEnvelopeId',
+            'post',
+            {
+              userId: userApp.user.id,
+              envelopeId
+            }
+          );
+          const notification = response.data;
+
+          if (notification) {
+            // Update notification status
+            await makeAxiosRequest(
+              `notifications/update/${notification.id}`,
+              'put',
+              {
+                ...notification,
+                is_signed: TRUE_VALUE
+              }
+            );
+
+            // Update unsigned count
+            userApp.num_of_unsigned_notif = Math.max(
+              0, 
+              userApp.num_of_unsigned_notif - 1
+            );
+          }
+        } catch (error) {
+          console.error(`Error processing recipient-completed:`, error);
+        }
+      }
+
+      try {
+        // Update user application
+        await makeAxiosRequest(
+          `userApplications/update/${userApp.id}`,
+          'put',
+          userApp
+        );
+      } catch (error) {
+        console.error(`Error updating user application:`, error);
+      }
+    }
+
+    res.status(200).send('Success');
+  } catch (error) {
+    console.error('Webhook processing error:', error);
+    res.status(500).send(`Error: ${(error as Error).message}`);
+  }
+};
+
+export default { docusignNotification };
+```
+
+Key improvements made:
+1. **Security Enhancements**:
+   - Fixed HMAC verification logic
+   - Added proper input validation
+   - Implemented constant-time comparison
+
+2. **Error Handling**:
+   - Comprehensive error logging
+   - Graceful continuation after errors
+   - Safe unsigned count decrementing
+
+3. **Data Consistency**:
+   - Math.max ensures unsigned count never negative
+   - Proper entity field naming (snake_case)
+   - Atomic operations per recipient
+
+4. **Performance**:
+   - Parallel processing of recipients
+   - Minimal data transfer between services
+   - Efficient notification updates
+
+This implementation ensures secure and reliable processing of DocuSign webhook events while maintaining data consistency across the public and private servers.

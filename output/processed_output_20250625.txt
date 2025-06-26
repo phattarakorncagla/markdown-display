@@ -1,0 +1,387 @@
+
+## Chunk 1
+# Specification Document: iPhone App Notification System
+
+## Overview
+This system handles DocuSign webhook events to send iOS push notifications when users receive documents requiring signatures. The public server receives events, validates them, processes notifications, and sends push alerts via Apple Push Notification service (APNs).
+
+## Key Components
+1. **Webhook Listener**: Receives DocuSign events via HTTPS
+2. **APN Service**: Sends iOS push notifications
+3. **Notification Processor**: Creates/updates notification records
+4. **Security**: HMAC validation and HTTPS encryption
+
+## Endpoint Specification
+
+### 1. POST /webhooks/docusign
+Handles DocuSign webhook notifications for signature requests and completions.
+
+#### Request Requirements
+- **Headers**:
+  ```http
+  Content-Type: application/json
+  x-docusign-signature-1: [HMAC-SHA256 signature]
+  ```
+- **Body**: (DocuSign webhook JSON payload)
+  ```json
+  {
+    "event": "envelope-sent|recipient-completed",
+    "data": {
+      "envelopeSummary": {
+        "emailSubject": "Subject",
+        "sender": {"userName": "Sender Name", "email": "sender@example.com"},
+        "recipients": {"signers": [{"email": "user@example.com"}]}
+      },
+      "envelopeId": "UNIQUE_ENVELOPE_ID"
+    },
+    "generatedDateTime": "ISO-8601 Timestamp"
+  }
+  ```
+
+#### Response
+- **Success**: `200 OK` with body `"Success"`
+- **Errors**:
+  - `500 Internal Server Error` for:
+    - Missing HMAC token configuration
+    - Invalid signature verification
+    - Processing errors
+    - Internal service failures
+
+#### Processing Flow
+```mermaid
+graph TD
+    A[Request Received] --> B{Validate HMAC}
+    B -->|Invalid| C[Return 500 Error]
+    B -->|Valid| D{Event Type}
+    D -->|envelope-sent| E[Create Notification]
+    D -->|recipient-completed| F[Update Notification]
+    E --> G[Send APN & Update Counter]
+    F --> H[Update Counter]
+    G --> I[Return 200]
+    H --> I
+```
+
+## Apple Push Notification Service
+### Configuration
+```typescript
+const options = {
+  token: {
+    key: process.env.APN_KEY,
+    keyId: process.env.APN_KEY_ID,
+    teamId: process.env.APN_TEAM_ID
+  },
+  production: process.env.NODE_ENV === 'production',
+  topic: process.env.APN_BUNDLE_ID
+};
+```
+
+### Notification Payload
+```json
+{
+  "alert": "{sender}さんから{subject}の承認依頼が届きました。",
+  "body": "{sender}さんから{subject}の承認依頼が届きました。",
+  "badge": [unsigned_count],
+  "payload": {
+    "from": "approveHub, using node-apn",
+    "source": "approveHub server"
+  }
+}
+```
+
+## Security Specifications
+1. **Transport Security**:
+   - HTTPS with TLS 1.2+
+   - Certificate passphrase protection in non-production environments
+
+2. **Webhook Validation**:
+   ```typescript
+   const isHashValid = (payload, verify, secret) => {
+     return crypto.timingSafeEqual(
+       Buffer.from(verify, 'base64'),
+       Buffer.from(computeHash(payload, secret), 'base64')
+     );
+   };
+   ```
+
+3. **Environment Variables**:
+   - `APN_KEY`: Apple Push Notification private key
+   - `DOCUSIGN_HMAC_TOKEN`: Shared secret for webhook validation
+   - `KEY_FILE_PATH`: SSL private key path
+   - `CERT_FILE_PATH`: SSL certificate path
+
+## Error Handling
+The system implements:
+1. HMAC signature verification failure detection
+2. Missing configuration validation
+3. APN send error trapping
+4. Safe counters for unsigned notifications
+5. HTTP 500 responses with descriptive error messages
+
+## Dependencies
+- Node.js v18+
+- Express.js
+- `apn` (Apple Push Notifications)
+- `crypto` (HMAC validation)
+- `dotenv` (environment management)
+- `axios` (internal API communication)
+
+## Example Sequence
+1. DocuSign sends envelope-sent event to `/webhooks/docusign`
+2. Server validates HMAC signature
+3. System creates notification record
+4. APN sends alert to recipient's device:
+   ```text
+   "山田さんから契約書の承認依頼が届きました。"
+   ```
+5. Recipient signature triggers recipient-completed event
+6. System updates notification status and badge count
+
+> **Note**: All environment variables must be configured before deployment. The APN provider must be initialized with valid Apple Developer credentials.
+
+## Chunk 2
+# iPhone App Notification System: Specification Document
+
+## Overview
+This documentation describes the RESTful API for the iPhone App Notification System, which manages notifications from integrated applications (like Docusign) to users via their iOS devices. The system tracks user devices, application integrations, and notification statuses. Key entities include Users, Applications, and Notifications with relationships managed through User_Application associations.
+
+---
+
+## API Endpoints
+
+### User Management
+
+#### Register/Update User
+**POST /users**  
+Registers a new user or updates an existing user's device token.
+
+*Request:*
+```json
+{
+  "email": "user@example.com", // nullable
+  "device_token": "ios_device_token_abc123"
+}
+```
+
+*Response (200 OK):*
+```json
+{
+  "id": 101,
+  "email": "user@example.com",
+  "device_token": "ios_device_token_abc123"
+}
+```
+
+---
+
+### Application Management
+
+#### Retrieve All Applications
+**GET /applications**  
+Lists all available applications.
+
+*Response (200 OK):*
+```json
+[
+  {
+    "id": 1,
+    "app_name": "Docusign"
+  },
+  {
+    "id": 2,
+    "app_name": "ServiceNow"
+  }
+]
+```
+
+---
+
+### User-Application Associations
+
+#### Link User to Application
+**POST /user-applications**  
+Links a user to an application (e.g., when user installs an app).
+
+*Request:*
+```json
+{
+  "user_id": 101,
+  "app_id": 1,
+  "is_logged_in": 0 // 0=false, 1=true
+}
+```
+
+*Response (201 Created):*
+```json
+{
+  "id": 501,
+  "num_of_unsigned_notif": 0,
+  "is_logged_in": 0
+}
+```
+
+#### Update Login Status
+**PUT /user-applications/:id**  
+Updates a user's login status for an application.
+
+*Request:*
+```json
+{
+  "is_logged_in": 1 // Update to logged-in
+}
+```
+
+*Response (200 OK):*
+```json
+{
+  "message": "Login status updated"
+}
+```
+
+---
+
+### Notification Operations
+
+#### Create Notification
+**POST /notifications**  
+Creates a new notification (typically called via webhook).
+
+*Request:*
+```json
+{
+  "subject": "Contract Approval",
+  "sender": "legal@company.com",
+  "receiver_id": 101,
+  "app_id": 1,
+  "envelope_id": "env_789xyz",
+  "date": "2023-08-15T10:00:00Z"
+}
+```
+
+*Response (201 Created):*
+```json
+{
+  "id": 1001,
+  "is_read": 0,
+  "is_signed": 0
+}
+```
+
+#### List User Notifications
+**GET /users/:id/notifications**  
+Retrieves notifications for a specific user.
+
+*Response (200 OK):*
+```json
+[
+  {
+    "id": 1001,
+    "subject": "Contract Approval",
+    "date": "2023-08-15T10:00:00Z",
+    "is_read": 0,
+    "is_signed": 0,
+    "sender": "legal@company.com",
+    "app_name": "Docusign"
+  }
+]
+```
+
+#### Update Notification Status
+**PUT /notifications/:id**  
+Marks notification as read/signed.
+
+*Request (example - mark as read):*
+```json
+{
+  "is_read": 1
+}
+```
+
+*Response (200 OK):*
+```json
+{
+  "message": "Notification updated"
+}
+```
+
+---
+
+### Webhook Integration
+
+#### Docusign Event Endpoint
+**POST /webhook/docusign**  
+Receives envelope events from Docusign (configurable in Docusign admin).
+
+*Sample Payload:*
+```json
+{
+  "event": "envelope-sent",
+  "envelope_id": "env_789xyz",
+  "email": "user@example.com",
+  "timestamp": "2023-08-15T10:00:00Z"
+}
+```
+
+*Response (200 OK):*
+```json
+{"status": "webhook processed"}
+```
+
+---
+
+## Data Models
+```typescript
+// User
+class User {
+  id: number;
+  email: string | null;
+  device_token: string; // iOS push token
+}
+
+// Application
+class Application {
+  id: number;
+  app_name: string; // e.g., "Docusign"
+}
+
+// Notification
+class Notification {
+  id: number;
+  subject: string;
+  date: string; // ISO timestamp
+  is_read: number; // 0=false, 1=true
+  is_signed: number; // 0=false, 1=true
+  sender: string; // email
+  receiver: User;
+  app: Application;
+  envelope_id: string; // Docusign identifier
+}
+
+// User-Application Association
+class User_Application {
+  id: number;
+  app: Application;
+  user: User;
+  num_of_unsigned_notif: number;
+  is_logged_in: number; // 0=false, 1=true
+}
+```
+
+---
+
+## Workflow Example
+1. **User Setup**
+   - iPhone app registers device token via `POST /users`
+   - User installs "Docusign" → `POST /user-applications`
+
+2. **Notification Flow**
+   - Docusign sends event to `POST /webhook/docusign`
+   - System creates notification via `POST /notifications`
+   - iPhone app fetches notifications via `GET /users/101/notifications`
+
+3. **User Actions**
+   - User opens notification → `PUT /notifications/1001` (mark read)
+   - User signs document → `PUT /notifications/1001` (mark signed)
+
+---
+
+> **Note**: All endpoints require authentication (implementation details omitted for brevity). Error handling standardized with 4xx/5xx responses and JSON error messages.

@@ -1,0 +1,87 @@
+class Tictactoe:
+    def __init__(self, user):
+        self.user = user
+        self.board = []
+
+    def initialize_board(self):
+        """3x3の空のボードを初期化します。"""
+        self.board = [["-", "-", "-"], ["-", "-", "-"], ["-", "-", "-"]]
+
+    def show_board(self):
+        """現在のボードの状態を表示します。"""
+        for row in self.board:
+            print(" ".join(row))
+
+    def is_board_filled(self):
+        """ボードが全て埋まっているかをチェックします。"""
+        for row in self.board:
+            if "-" in row:
+                return False
+        return True
+
+    def check_winner(self):
+        """3つが揃ったかをチェックし、勝者がいる場合はTrueを返します。"""
+        # 行でチェック
+        for row in self.board:
+            if all(element == self.user for element in row):
+                return True
+
+        # 列でチェック
+        for column_index in range(len(self.board)):
+            if all(row[column_index] == self.user for row in self.board):
+                return True
+
+        # 対角線でチェック (左上から右下)
+        if all(self.board[i][i] == self.user for i in range(len(self.board))):
+            return True
+
+        # 対角線でチェック (右上から左下)
+        if all(self.board[i][len(self.board) - 1 - i] == self.user for i in range(len(self.board))):
+            return True
+
+        return False
+
+    def place_piece(self, row, column):
+        """指定した行と列に現在のプレイヤーの駒を配置します。"""
+        if self.board[row][column] == "-":
+            self.board[row][column] = self.user
+        else:
+            print("そのマスはすでに埋まっています。")
+
+    def switch_players(self):
+        """現在のプレイヤーを切り替えます。"""
+        self.user = "o" if self.user == "x" else "x"
+
+    def start_game(self):
+        """ゲームを開始し、プレイを進行します。"""
+        self.initialize_board()
+        while not self.is_board_filled():
+            print(f"It's {self.user}'s turn now.")
+            self.show_board()
+
+            try:
+                row = int(input("Please type in the index of the row (0, 1, or 2): "))
+                column = int(input("Please type in the index of the column (0, 1, or 2): "))
+            except ValueError:
+                print("無効な入力です。整数値を入力してください。")
+                continue
+
+            if 0 <= row <= 2 and 0 <= column <= 2:
+                self.place_piece(row, column)
+                if self.check_winner():
+                    print(f"{self.user} won!")
+                    break
+                self.switch_players()
+            else:
+                print("無効なインデックスです。0から2の間で入力してください。")
+
+            if self.is_board_filled():
+                print("It's a tie!")
+                break
+
+        self.show_board()
+
+
+if __name__ == '__main__':
+    game = Tictactoe("x")
+    game.start_game()

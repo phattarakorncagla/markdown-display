@@ -1,3 +1,4 @@
+from datetime import datetime
 import os
 import requests
 import time
@@ -41,8 +42,9 @@ def split_text(text, max_chars=8000):
 
 def main():
     input_file = "repository_contents_all_src.txt"
-    output_file = "processed_output_all_src.txt"
-    model = "deepseek/deepseek-r1-0528"  # Update to a public-access model if needed
+    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")  
+    output_file = f"processed_output_{date_str}.txt"
+    model = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B" 
 
     prompt = """You are an expert technical writer specializing in writing documentation for software projects. 
 You are tasked with writing a new Specification Document file for the given project.

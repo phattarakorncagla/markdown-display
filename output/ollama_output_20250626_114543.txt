@@ -1,0 +1,17 @@
+
+## Chunk 1
+### initialize_board (self) [no argument] Initialize the 3x3 board with all values as "-". 
+
+### show_board (self) [no argument] Show the current state of the board. 
+
+### is_board_filled (self) [no argument] Check if the board is filled with values. If it's not, return False . Otherwise, return True . 
+
+### check_winner (self) [no argument] Check if there are 3 in a row, column or diagonal. If there are, return True . Otherwise, return False . 
+
+### place_piece (self, row , column ) [row: int, column: int] Place the current player's piece at the specified position on the board. 
+
+### switch_players (self) [no argument] Switch to the other player. 
+
+### start_game (self) [no argument] Start a new game and play until it is filled or a winner is found. 
+
+Note: This is not an exhaustive list of all functions, endpoints, and explanations. Only add what is necessary for the reader to understand the code.

@@ -1,0 +1,45 @@
+
+## Chunk 1
+## initialize_board()
+
+### Description
+
+3x3の空のボードを初期化します。
+
+## show_board()
+
+### Description
+
+現在のボードの状態を表示します。 
+
+## is_board_filled()
+
+### Description
+
+ボードが全て埋まっているかをチェックします。 
+
+## check_winner()
+
+### Description
+
+3つが揃ったかをチェックし、勝者がいる場合はTrueを返します。 
+
+## place_piece(row, column)
+
+### Description
+
+指定した行と列に現在のプレイヤーの駒を配置します。 
+
+## switch_players()
+
+### Description
+
+現在のプレイヤーを切り替えます。 
+
+## start_game()
+
+### Description
+
+ゲームを開始し、プレイを進行します。 
+
+Note: The above documentation is written in plain markdown and can be easily converted to other formats such as HTML or LaTeX.
