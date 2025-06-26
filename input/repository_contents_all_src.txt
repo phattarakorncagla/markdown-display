@@ -1,0 +1,4344 @@
+
+=== ./private-server\src\data_source.ts ===
+
+import { DataSource } from 'typeorm';
+import { User } from './entity/User';
+import { Application } from './entity/Application';
+import { Notification } from './entity/Notification';
+import { User_Application } from './entity/User_Application';
+
+const ServerDB = new DataSource({
+  type: 'sqlite',
+  database: 'data/db.sqlite',
+  synchronize: true,
+  logging: true,
+  entities: [User, Application, Notification, User_Application],
+  migrations: [],
+  subscribers: [],
+});
+
+export default ServerDB;
+
+
+=== ./private-server\src\server.ts ===
+
+import dotenv from 'dotenv';
+
+dotenv.config({ path: `.env.${process.env.NODE_ENV || 'development'}` });
+
+import express, { Application, Request, Response } from 'express';
+import 'reflect-metadata';
+import ServerDB from './data_source';
+import routes from './api/routes/routes';
+import session from 'express-session';
+
+const app: Application = express();
+const port = 80;
+
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET!,
+    resave: false,
+    saveUninitialized: true,
+    cookie: {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      maxAge: 1000 * 60 * 60 * 24,
+    },
+  }),
+);
+app.use(express.json());
+
+ServerDB.initialize()
+  .then(() => {
+    app.use('/', routes);
+
+    app.get('/', (_: Request, res: Response) => {
+      res.send('Hello, TypeScript + Node.js + Express!');
+    });
+
+    app.listen(port, () => {
+      console.log(`HTTP server is running on port ${port}`);
+    });
+  })
+  .catch((error: Error) => {
+    console.error(error);
+  });
+
+
+=== ./private-server\src\api\controllers\appController.ts ===
+
+import { Request, Response } from 'express';
+import applicationService from '../services/applicationService';
+import ServerDB from '../../data_source';
+import { Application } from '../../entity/Application';
+
+const appRepository = ServerDB.getRepository(Application);
+
+const findAll = async (_: Request, res: Response) => {
+  try {
+    const apps = await applicationService.findAll(appRepository);
+    res.json(apps);
+  } catch (error) {
+    res.status(500).send(`Error getting apps: ${(error as Error).message}`);
+  }
+};
+
+export default {
+  findAll,
+};
+
+
+=== ./private-server\src\api\controllers\authController.ts ===
+
+import { Request, Response } from 'express';
+import crypto from 'crypto';
+import ServerDB from '../../data_source';
+import { Application } from '../../entity/Application';
+import { Notification } from '../../entity/Notification';
+import { User } from '../../entity/User';
+import { User_Application } from '../../entity/User_Application';
+import userService from '../services/userService';
+import notificationService from '../services/notificationService';
+import userApplicationService from '../services/userApplicationService';
+import { UpdateRequest } from '../models/userModel';
+import { Envelope, EnvelopeFolder, EnvelopesData } from '../models/authModel';
+import { hash } from '../utils/encryption';
+declare module 'express-session' {
+  // eslint-disable-next-line no-unused-vars
+  interface SessionData {
+    codeVerifier?: string;
+    deviceToken?: string;
+  }
+}
+
+const notificationRepository = ServerDB.getRepository(Notification);
+const userAppRepository = ServerDB.getRepository(User_Application);
+const userRepository = ServerDB.getRepository(User);
+
+type DocusignUserInfo = {
+  sub: string;
+  name: string;
+  given_name: string;
+  family_name: string;
+  created: string;
+  email: string;
+  accounts: {
+    account_id: string;
+    is_default: boolean;
+    account_name: string;
+    base_uri: string;
+  }[];
+};
+
+const FALSE_VALUE: number = 0;
+const TRUE_VALUE: number = 1;
+const COMPLETE: string = 'completed';
+const SCOPE = 'signature%20impersonation';
+
+const docusignId: number = 1;
+const docusignApp: Application = {
+  id: docusignId,
+  app_name: 'Docusign',
+};
+
+const deviceTokenStorage: {
+  [deviceToken: string]: string;
+} = {};
+
+const authLogin = async (req: Request, res: Response) => {
+  const appId: number = parseInt(req.params.appId);
+
+  const deviceToken: string = req.headers['device-token'] as string;
+
+  if (appId === docusignId) {
+    if (
+      !process.env.DOCUSIGN_APP_INTEGRATION_KEY ||
+      !process.env.DOCUSIGN_REDIRECT_URI
+    ) {
+      res.status(500).send('Missing required environment variables');
+      return;
+    }
+
+    const appIntegrationKey = process.env.DOCUSIGN_APP_INTEGRATION_KEY;
+    const redirectUri = process.env.DOCUSIGN_REDIRECT_URI;
+
+    const generateCodeVerifier = (): string => {
+      return crypto.randomBytes(32).toString('base64url');
+    };
+
+    const generateCodeChallenge = (codeVerifier: string): string => {
+      const sha256 = crypto.createHash('sha256');
+      sha256.update(codeVerifier);
+      return sha256.digest('base64url');
+    };
+
+    const codeVerifier = generateCodeVerifier();
+    const codeChallenge = generateCodeChallenge(codeVerifier);
+
+    req.session.codeVerifier = codeVerifier;
+    req.session.deviceToken = deviceToken;
+    deviceTokenStorage[deviceToken] = codeVerifier;
+    console.log('login', deviceToken);
+
+    const authUrl = `https://account-d.docusign.com/oauth/auth?response_type=code&client_id=${appIntegrationKey}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(SCOPE)}&code_challenge=${encodeURIComponent(codeChallenge)}&code_challenge_method=S256&state=${deviceToken}`;
+    res.redirect(authUrl);
+  } else {
+    res.status(400).send('No login available for this app');
+  }
+};
+
+const docusignLoginSuccess = async (
+  req: Request,
+  res: Response,
+  getDocusignUserInfoAndEnvelopesFn: typeof getDocusignUserInfoAndEnvelopes = getDocusignUserInfoAndEnvelopes,
+  createOrUpdateNotifcationFromEnvelopesFn: typeof createOrUpdateNotifcationFromEnvelopes = createOrUpdateNotifcationFromEnvelopes,
+  updateUserApplicationFn: typeof updateUserApplication = updateUserApplication,
+) => {
+  const authCode = req.query.code as string;
+  // const deviceToken = req.session.deviceToken as string;
+  const deviceToken = req.query.state as string;
+  console.log('login success', deviceToken);
+
+  try {
+    if (!authCode) {
+      throw new Error('No auth code provided');
+    }
+  
+    if (!deviceToken) {
+      throw new Error('No device token found');
+    }
+  
+    // const codeVerifier = req.session.codeVerifier;
+    const codeVerifier = deviceTokenStorage[deviceToken];
+    if (!codeVerifier) {
+      throw new Error('No code verifier found');
+    }
+
+    const comboAppSecretKey: string = `${process.env.DOCUSIGN_APP_INTEGRATION_KEY}:${process.env.DOCUSIGN_PKCE_KEY}`;
+    const base64: string = Buffer.from(comboAppSecretKey).toString('base64');
+
+    const body = new URLSearchParams();
+    body.append('grant_type', 'authorization_code');
+    body.append('code', authCode);
+    body.append('code_verifier', codeVerifier);
+
+    let response = await fetch('https://account-d.docusign.com/oauth/token', {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${base64}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: body.toString(),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      res
+        .status(response.status)
+        .send(`Error getting access token: ${error.error_description}`);
+      return;
+    }
+
+    const { access_token: accessToken } = await response.json();
+
+    const { userInfo, envelopes } =
+      await getDocusignUserInfoAndEnvelopesFn(accessToken);
+    const userEmail = hash(userInfo.email);
+    const userEnvelopes = envelopes;
+
+    const user = await userService.findUserByDeviceToken(
+      userRepository,
+      deviceToken,
+    );
+
+    if (!user) {
+      res.status(500).send('Error getting access token: User not found');
+      return;
+      // throw new Error('User not found');
+    }
+
+    const foundUserByEmail = await userService.findUserByEmail(
+      userRepository,
+      userEmail,
+    );
+
+    const updateRequest: UpdateRequest = {
+      id: foundUserByEmail ? foundUserByEmail.id : user.id,
+      email: userEmail,
+      deviceToken: deviceToken,
+    };
+    user.email = userEmail;
+    if (foundUserByEmail) user.id = foundUserByEmail.id;
+    await userService.update(userRepository, updateRequest);
+
+    if (userEnvelopes.length > 0) {
+      await createOrUpdateNotifcationFromEnvelopesFn(userEnvelopes, userEmail);
+    }
+
+    await updateUserApplicationFn(user, docusignApp);
+
+    // delete deviceTokenStorage[deviceToken];
+    res.send({
+      user,
+      message: 'ログインに成功しました。',
+    });
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error getting access token: ${(error as Error).message}`);
+  }
+};
+
+const getDocusignUserInfoAndEnvelopes = async (
+  accessToken: string
+): Promise<{ userInfo: DocusignUserInfo; envelopes: Envelope[] }> => {
+  const userInfoResponse = await fetch(
+    'https://account-d.docusign.com/oauth/userinfo',
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    },
+  );
+
+  if (!userInfoResponse.ok) {
+    const errorResponse = await userInfoResponse.json();
+    throw new Error(`Error getting user info: ${errorResponse.error_description}`);
+  }
+
+  const userInfo: DocusignUserInfo = await userInfoResponse.json();
+  const accountId = userInfo.accounts[0]?.account_id;
+  if (!accountId) {
+    throw new Error('No account found for the user');
+  }
+
+  const envelopesResponse = await fetch(
+    `https://demo.docusign.net/restapi/v2.1/accounts/${accountId}/folders/inbox?from_date=2025-01-01&include_items=true`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    },
+  );
+
+  if (!envelopesResponse.ok) {
+    const errorResponse = await envelopesResponse.json();
+    console.error('DocuSign API Error:', errorResponse);
+    throw new Error(
+      `Error fetching envelopes: ${errorResponse.message || JSON.stringify(errorResponse)}`,
+    );
+  }
+
+  const envelopesData: EnvelopesData = await envelopesResponse.json();
+  const allEnvelopes = flattenEnvelopes(envelopesData);
+  return { userInfo, envelopes: allEnvelopes };
+};
+
+const createOrUpdateNotifcationFromEnvelopes = async (
+  envelopes: Envelope[],
+  userEmail: string
+): Promise<void> => {
+  const user = await userService.findUserByEmail(userRepository, userEmail);
+  if (!user) {
+    throw new Error('User not found');
+  }
+
+  const userId = user.id;
+  const userNotifications = await notificationService.findNotificationsByUserIdAndAppId(
+    notificationRepository,
+    userId,
+    docusignId,
+  );
+
+  for (const envelope of envelopes) {
+    const envelopeId = envelope.envelopeId;
+    const foundNotification = userNotifications.find(
+      (notification) => notification.envelope_id === envelopeId,
+    );
+
+    if (!foundNotification) {
+      const splitSubject = envelope.subject.split(': ');
+      const sender = envelope.senderName || envelope.senderEmail;
+      const newNotification = new Notification(
+        splitSubject.length > 1 ? splitSubject[1] : envelope.subject,
+        envelope.createdDateTime,
+        0,
+        envelope.status === 'completed' ? TRUE_VALUE : FALSE_VALUE,
+        sender,
+        user,
+        docusignApp,
+        envelopeId,
+      );
+      await notificationService.create(notificationRepository, newNotification);
+    } else if (
+      foundNotification.is_signed === FALSE_VALUE &&
+      envelope.status === COMPLETE
+    ) {
+      foundNotification.is_signed = TRUE_VALUE;
+      await notificationService.update(notificationRepository, foundNotification);
+    }
+  }
+};
+
+const updateUserApplication = async (
+  user: User,
+  app: Application,
+): Promise<void> => {
+  const userId = user.id;
+  const appId = app.id;
+
+  const unsignedNotificationCount =
+    await notificationService.getUnsignedNotificationCount(
+      notificationRepository,
+      userId,
+      appId,
+    );
+  const userApplication = await userApplicationService.findOneByUserIdAndAppId(
+    userAppRepository,
+    userId,
+    appId,
+  );
+
+  if (!userApplication) {
+    const newUserApp = new User_Application(
+      app,
+      user,
+      unsignedNotificationCount,
+      1,
+    );
+    await userApplicationService.create(userAppRepository, newUserApp);
+  } else {
+    const userApp = userApplication;
+    userApp.num_of_unsigned_notif = unsignedNotificationCount;
+    userApp.is_logged_in = 1;
+    await userApplicationService.update(userAppRepository, userApp);
+  }
+};
+
+const flattenEnvelopes = (envelopesData: EnvelopesData): Envelope[] => {
+  const flattened: Envelope[] = [];
+
+  const processFolder = (folder: EnvelopeFolder | Envelope[]) => {
+    if (Array.isArray(folder)) {
+      flattened.push(...folder);
+    } else {
+      if (folder.folderItems && Array.isArray(folder.folderItems)) {
+        flattened.push(...folder.folderItems);
+      }
+      if (folder.folders && Array.isArray(folder.folders)) {
+        folder.folders.forEach(processFolder);
+      }
+    }
+  };
+
+  if (envelopesData.folders && Array.isArray(envelopesData.folders)) {
+    envelopesData.folders.forEach(processFolder);
+  }
+
+  return flattened;
+};
+
+export default {
+  authLogin,
+  docusignLoginSuccess,
+};
+
+
+=== ./private-server\src\api\controllers\deviceController.ts ===
+
+import { Request, Response } from 'express';
+import { User } from '../../entity/User';
+import userService from '../services/userService';
+import { CreateRequest, UpdateRequest } from '../models/userModel';
+import { hash } from '../utils/encryption';
+import ServerDB from '../../data_source';
+
+const userRepository = ServerDB.getRepository(User);
+
+const create = async (req: Request, res: Response) => {
+  try {
+    const { email, deviceToken } = req.body as CreateRequest;
+    if (!deviceToken) {
+      res.status(400).send('Missing deviceToken');
+      return;
+    }
+
+    let encryptedEmail: string | undefined = undefined;
+    let user = await userService.findUserByDeviceToken(
+      userRepository,
+      deviceToken,
+    );
+    if (!user && email) {
+      encryptedEmail = hash(email);
+      user = await userService.findUserByEmail(userRepository, encryptedEmail);
+    }
+
+    if (user) {
+      res.status(400).send('User already exists');
+      return;
+    }
+
+    const newUser = new User(encryptedEmail ?? null, deviceToken);
+
+    user = await userService.create(userRepository, newUser);
+    res.send(user);
+  } catch (error) {
+    res.status(500).send(`Error creating user: ${(error as Error).message}`);
+  }
+};
+
+const update = async (req: Request, res: Response) => {
+  try {
+    const userId = parseInt(req.params.userId);
+    const user = await userService.findUserById(userRepository, userId);
+    if (!user) {
+      res.status(404).send('User not found');
+      return;
+    }
+
+    const { deviceToken, email } = req.body;
+
+    let encryptedEmail: string | undefined = undefined;
+    if (email) {
+      encryptedEmail = hash(email);
+    }
+
+    const updateUserInfo: UpdateRequest = {
+      id: userId,
+      deviceToken,
+      email: encryptedEmail,
+    };
+
+    const updatedUser = await userService.update(
+      userRepository,
+      updateUserInfo,
+    );
+    res.send(updatedUser);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error updating user device token: ${(error as Error).message}`);
+  }
+};
+
+export default {
+  create,
+  update,
+};
+
+
+=== ./private-server\src\api\controllers\notificationController.ts ===
+
+import { Request, Response } from 'express';
+import notificationService from '../services/notificationService';
+import { UpdateRequest } from '../models/notificationModel';
+import ServerDB from '../../data_source';
+import { Notification } from '../../entity/Notification';
+
+const notificationRepository = ServerDB.getRepository(Notification);
+
+const create = async (req: Request, res: Response) => {
+  try {
+    const notification = await notificationService.create(
+      notificationRepository,
+      req.body,
+    );
+    res.json(notification);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error creating notification: ${(error as Error).message}`);
+  }
+};
+
+const findAllByUserIdAndAppId = async (req: Request, res: Response) => {
+  try {
+    const userId = Number(req.body.userId);
+    const appId = Number(req.body.appId);
+
+    if (!userId || !appId) {
+      res.status(400).send('Missing required fields');
+      return;
+    }
+
+    const notifications =
+      await notificationService.findNotificationsByUserIdAndAppId(
+        notificationRepository,
+        userId,
+        appId,
+      );
+    res.json(notifications);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error getting notifications: ${(error as Error).message}`);
+  }
+};
+
+const findByUserIdAndEnvelopeId = async (req: Request, res: Response) => {
+  try {
+    const userId = Number(req.body.userId);
+    const envelopeId = req.body.envelopeId;
+
+    if (!userId || !envelopeId) {
+      res.status(400).send('Missing required fields');
+      return;
+    }
+
+    const notification =
+      await notificationService.findNotificationByUserIdAndEnvelopeId(
+        notificationRepository,
+        userId,
+        envelopeId,
+      );
+    res.json(notification);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error getting notification: ${(error as Error).message}`);
+  }
+};
+
+const getUnsignedNotificationCount = async (req: Request, res: Response) => {
+  try {
+    const userId = Number(req.body.userId);
+    const appId = Number(req.body.appId);
+
+    if (!userId || !appId) {
+      res.status(400).send('Missing required fields');
+      return;
+    }
+
+    const count = await notificationService.getUnsignedNotificationCount(
+      notificationRepository,
+      userId,
+      appId,
+    );
+    res.json(count);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error getting notification count: ${(error as Error).message}`);
+  }
+};
+
+const update = async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const { isRead, isSigned } = req.body as UpdateRequest;
+
+    if (!id || (isRead == null && isSigned == null)) {
+      res.status(400).send('Missing required fields');
+      return;
+    }
+
+    const notification = await notificationService.findNotificationById(
+      notificationRepository,
+      id,
+    );
+    if (!notification) {
+      res.status(404).send('Notification not found');
+      return;
+    }
+
+    notification.is_read = isRead ?? notification.is_read;
+    notification.is_signed = isSigned ?? notification.is_signed;
+
+    const updatedNotification = await notificationService.update(
+      notificationRepository,
+      notification,
+    );
+    res.json(updatedNotification);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error updating notification: ${(error as Error).message}`);
+  }
+};
+
+export default {
+  create,
+  findAllByUserIdAndAppId,
+  findByUserIdAndEnvelopeId,
+  getUnsignedNotificationCount,
+  update,
+};
+
+
+=== ./private-server\src\api\controllers\userApplicationController.ts ===
+
+import { Request, Response } from 'express';
+import { User } from '../../entity/User';
+import { Application } from '../../entity/Application';
+import { User_Application } from '../../entity/User_Application';
+import userService from '../services/userService';
+import applicationService from '../services/applicationService';
+import userApplicationService from '../services/userApplicationService';
+import { UpdateRequest } from '../models/userApplicationModel';
+import { hash } from '../utils/encryption';
+import ServerDB from '../../data_source';
+
+const userRepository = ServerDB.getRepository(User);
+const appRepository = ServerDB.getRepository(Application);
+const userAppRepository = ServerDB.getRepository(User_Application);
+
+const create = async (req: Request, res: Response) => {
+  try {
+    const { appId, userId, numOfUnsignedNotif, isLoggedIn } = req.body;
+
+    // Changed to == null to check for null and undefined
+    if (!appId || !userId || numOfUnsignedNotif == null || isLoggedIn == null) {
+      res
+        .status(400)
+        .send('appId, userId, numOfUnsignedNotif, and isLoggedIn are required');
+      return;
+    }
+
+    const isUserFound = await userApplicationService.findOneByUserIdAndAppId(
+      userAppRepository,
+      userId,
+      appId,
+    );
+    if (isUserFound) {
+      res
+        .status(400)
+        .send(
+          'The application has already been added by the user.' +
+            JSON.stringify(isUserFound.id),
+        );
+      return;
+    }
+
+    const user = await userService.findUserById(userRepository, userId);
+    if (!user) {
+      res.status(404).send('User not found');
+      return;
+    }
+
+    const application = await applicationService.findOneById(
+      appRepository,
+      appId,
+    );
+    if (!application) {
+      res.status(404).send('Application not found');
+      return;
+    }
+
+    const newUserApplication = new User_Application(
+      application,
+      user,
+      numOfUnsignedNotif,
+      isLoggedIn,
+    );
+    const userApplication = await userApplicationService.create(
+      userAppRepository,
+      newUserApplication,
+    );
+    res.json(userApplication);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error creating user application: ${(error as Error).message}`);
+  }
+};
+
+const findByUserId = async (req: Request, res: Response) => {
+  try {
+    const userId = parseInt(req.params.userId);
+    const userApplications = await userApplicationService.findByUserId(
+      userAppRepository,
+      userId,
+    );
+    res.json(userApplications);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error getting user applications: ${(error as Error).message}`);
+  }
+};
+
+const findByEmailAndAppId = async (req: Request, res: Response) => {
+  try {
+    const { email, appId } = req.body;
+    if (!email || !appId) {
+      res.status(400).send('email and appId are required');
+      return;
+    }
+
+    const encryptedEmail = hash(email);
+
+    const userApplication = await userApplicationService.findByEmailAndAppId(
+      userAppRepository,
+      encryptedEmail,
+      appId,
+    );
+    res.json(userApplication);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error getting user application: ${(error as Error).message}`);
+  }
+};
+
+const findByUserIdAndAppId = async (req: Request, res: Response) => {
+  try {
+    const { userId, appId } = req.body;
+    if (!userId || !appId) {
+      res.status(400).send('userId and appId are required');
+      return;
+    }
+
+    const userApplication =
+      await userApplicationService.findOneByUserIdAndAppId(
+        userAppRepository,
+        userId,
+        appId,
+      );
+    res.json(userApplication);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error getting user application: ${(error as Error).message}`);
+  }
+};
+
+const update = async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const { numOfUnsignedNotif, isLoggedIn } = req.body as UpdateRequest;
+
+    if (!id || (numOfUnsignedNotif == null && isLoggedIn == null)) {
+      res.status(400).send('Missing required fields');
+      return;
+    }
+
+    const userApp = await userApplicationService.findOneById(
+      userAppRepository,
+      id,
+    );
+    if (!userApp) {
+      res.status(404).send('User application not found');
+      return;
+    }
+
+    userApp.num_of_unsigned_notif =
+      numOfUnsignedNotif ?? userApp.num_of_unsigned_notif;
+    userApp.is_logged_in = isLoggedIn ?? userApp.is_logged_in;
+
+    const updatedUserApp = await userApplicationService.update(
+      userAppRepository,
+      userApp,
+    );
+    res.json(updatedUserApp);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error updating user application: ${(error as Error).message}`);
+  }
+};
+
+const deleteById = async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id);
+    await userApplicationService.deleteById(userAppRepository, id);
+    res.send('User application deleted');
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error deleting user application: ${(error as Error).message}`);
+  }
+};
+
+export default {
+  create,
+  findByUserId,
+  findByEmailAndAppId,
+  findByUserIdAndAppId,
+  update,
+  deleteById,
+};
+
+
+=== ./private-server\src\api\controllers\userController.ts ===
+
+import { Request, Response } from 'express';
+import userService from '../services/userService';
+import { UpdateRequest } from '../models/userModel';
+import { hash } from '../utils/encryption';
+import ServerDB from '../../data_source';
+import { User } from '../../entity/User';
+
+const userRepository = ServerDB.getRepository(User);
+
+const findAll = async (_: Request, res: Response) => {
+  try {
+    const users = await userService.findAll(userRepository);
+    res.json(users);
+  } catch (error) {
+    res.status(500).send(`Error getting users: ${(error as Error).message}`);
+  }
+};
+
+const findOneById = async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id);
+    const user = await userService.findUserById(userRepository, id);
+    if (user) {
+      res.json(user);
+    } else {
+      res.status(404).send('User not found');
+    }
+  } catch (error) {
+    res.status(500).send(`Error getting user: ${(error as Error).message}`);
+  }
+};
+
+const findOneByDeviceToken = async (req: Request, res: Response) => {
+  try {
+    const deviceToken = req.body.deviceToken;
+    const user = await userService.findUserByDeviceToken(
+      userRepository,
+      deviceToken,
+    );
+    if (user) {
+      res.json(user);
+    } else {
+      res.status(404).send('User not found');
+    }
+  } catch (error) {
+    res.status(500).send(`Error getting user: ${(error as Error).message}`);
+  }
+};
+
+const findOneByEmail = async (req: Request, res: Response) => {
+  try {
+    const email = req.body.email;
+
+    const encryptedEmail = hash(email);
+
+    const user = await userService.findUserByEmail(
+      userRepository,
+      encryptedEmail,
+    );
+    if (user) {
+      res.json(user);
+    } else {
+      res.status(404).send('User not found');
+    }
+  } catch (error) {
+    res.status(500).send(`Error getting user: ${(error as Error).message}`);
+  }
+};
+
+const update = async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id);
+    const updateInfo = req.body as UpdateRequest;
+
+    const user = await userService.findUserById(userRepository, id);
+    if (!user) {
+      res.status(404).send('User not found');
+      return;
+    }
+
+    await userService.update(userRepository, updateInfo);
+    res.send('User updated');
+  } catch (error) {
+    res.status(500).send(`Error updating user: ${(error as Error).message}`);
+  }
+};
+
+const deleteById = async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id);
+    await userService.deleteById(userRepository, id);
+    res.send('User deleted');
+  } catch (error) {
+    res.status(500).send(`Error deleting user: ${(error as Error).message}`);
+  }
+};
+
+export default {
+  findAll,
+  findOneById,
+  findOneByDeviceToken,
+  findOneByEmail,
+  update,
+  deleteById,
+};
+
+
+=== ./private-server\src\api\models\authModel.ts ===
+
+
+type DocusignUserInfo = {
+  sub: string;
+  name: string;
+  given_name: string;
+  family_name: string;
+  created: string;
+  email: string;
+  accounts: {
+    account_id: string;
+    is_default: boolean;
+    account_name: string;
+    base_uri: string;
+  }[];
+};
+
+interface Envelope {
+  envelopeId: string;
+  subject: string;
+  createdDateTime: string;
+  status: string;
+  senderName?: string;
+  senderEmail: string;
+}
+
+interface EnvelopeFolder {
+  folderItems?: Envelope[];
+  folders?: (EnvelopeFolder | Envelope[])[];
+}
+
+interface EnvelopesData {
+  folders?: (EnvelopeFolder | Envelope[])[];
+}
+
+export { DocusignUserInfo, Envelope, EnvelopeFolder, EnvelopesData };
+
+=== ./private-server\src\api\models\notificationModel.ts ===
+
+interface CreateRequest {
+  subject: string;
+  date: string;
+  isRead: number;
+  isSigned: number;
+  sender: string;
+  receiver: number;
+  appId: number;
+  envelopeId: string;
+}
+
+interface UpdateRequest {
+  id: number;
+  isRead?: number;
+  isSigned?: number;
+}
+
+export { CreateRequest, UpdateRequest };
+
+
+=== ./private-server\src\api\models\userApplicationModel.ts ===
+
+import { Application } from '../../entity/Application';
+import { User } from '../../entity/User';
+
+interface CreateRequest {
+  appId: Application;
+  userId: User;
+  numOfUnsignedNotif: number;
+  isLoggedIn: number;
+}
+
+interface UpdateRequest {
+  id: number;
+  numOfUnsignedNotif?: number;
+  isLoggedIn?: number;
+}
+
+export { CreateRequest, UpdateRequest };
+
+
+=== ./private-server\src\api\models\userModel.ts ===
+
+interface CreateRequest {
+  email?: string | null;
+  deviceToken: string;
+}
+
+interface UpdateRequest {
+  id: number;
+  email?: string | null;
+  deviceToken: string;
+}
+
+export { CreateRequest, UpdateRequest };
+
+
+=== ./private-server\src\api\routes\appRoutes.ts ===
+
+import express, { Router } from 'express';
+import appController from '../controllers/appController';
+
+const router: Router = express.Router();
+
+router.get('/', appController.findAll);
+
+export default router;
+
+
+=== ./private-server\src\api\routes\deviceRoutes.ts ===
+
+import express, { Router } from 'express';
+import deviceController from '../controllers/deviceController';
+
+const router: Router = express.Router();
+
+router.post('/create', deviceController.create);
+router.put('/update/:userId', deviceController.update);
+
+export default router;
+
+
+=== ./private-server\src\api\routes\notificationRoutes.ts ===
+
+import express, { Router } from 'express';
+import notificationController from '../controllers/notificationController';
+
+const router: Router = express.Router();
+
+router.post('/create', notificationController.create);
+router.post(
+  '/findByUserIdAndAppId',
+  notificationController.findAllByUserIdAndAppId,
+);
+router.post(
+  '/findByUserIdAndEnvelopeId',
+  notificationController.findByUserIdAndEnvelopeId,
+);
+router.post(
+  '/getUnsignedNotificationCount',
+  notificationController.getUnsignedNotificationCount,
+);
+router.put('/update/:id', notificationController.update);
+
+export default router;
+
+
+=== ./private-server\src\api\routes\routes.ts ===
+
+import express, { Router } from 'express';
+
+// API routes
+import appRoutes from './appRoutes';
+import deviceRoutes from './deviceRoutes';
+import userRoutes from './userRoutes';
+import notificationRoutes from './notificationRoutes';
+import authController from '../controllers/authController';
+import userApplicationRoutes from './userApplicationRoutes';
+
+const router: Router = express.Router();
+
+router.use('/apps', appRoutes);
+router.use('/devices', deviceRoutes);
+router.use('/users', userRoutes);
+router.use('/notifications', notificationRoutes);
+router.use('/userApplications', userApplicationRoutes);
+
+router.get('/login/:appId', authController.authLogin);
+router.get('/docusign/login/success', (req, res) => authController.docusignLoginSuccess(req, res));
+
+export default router;
+
+
+=== ./private-server\src\api\routes\userApplicationRoutes.ts ===
+
+import express, { Router } from 'express';
+import userApplicationController from '../controllers/userApplicationController';
+
+const router: Router = express.Router();
+
+router.post('/create', userApplicationController.create);
+router.get('/findByUserId/:userId', userApplicationController.findByUserId);
+router.post(
+  '/findByEmailAndAppId',
+  userApplicationController.findByEmailAndAppId,
+);
+router.post(
+  '/findByUserIdAndAppId',
+  userApplicationController.findByUserIdAndAppId,
+);
+router.put('/update/:id', userApplicationController.update);
+router.delete('/delete/:id', userApplicationController.deleteById);
+
+export default router;
+
+
+=== ./private-server\src\api\routes\userRoutes.ts ===
+
+import express, { Router } from 'express';
+import userController from '../controllers/userController';
+
+const router: Router = express.Router();
+
+router.get('/', userController.findAll);
+router.get('/:id', userController.findOneById);
+router.post('/findByDeviceToken', userController.findOneByDeviceToken);
+router.post('/findByEmail', userController.findOneByEmail);
+router.delete('/delete/:id', userController.deleteById);
+
+export default router;
+
+
+=== ./private-server\src\api\services\applicationService.ts ===
+
+import { Repository } from 'typeorm';
+import { Application } from '../../entity/Application';
+
+const findAll = async (
+  appRepository: Repository<Application>,
+): Promise<Application[]> => {
+  return await appRepository.find();
+};
+
+const findOneById = async (
+  appRepository: Repository<Application>,
+  id: number,
+): Promise<Application | null> => {
+  return await appRepository.findOneBy({ id });
+};
+
+export default {
+  findAll,
+  findOneById,
+  // create,
+  // update,
+  // deleteById,
+};
+
+
+=== ./private-server\src\api\services\notificationService.ts ===
+
+import { Repository } from 'typeorm';
+import { Notification } from '../../entity/Notification';
+
+const FALSE_VALUE = 0;
+
+const create = async (
+  notificationRepository: Repository<Notification>,
+  notification: Notification,
+): Promise<Notification> => {
+  return await notificationRepository.save(notification);
+};
+
+const findNotificationById = async (
+  notificationRepository: Repository<Notification>,
+  id: number,
+): Promise<Notification | null> => {
+  return await notificationRepository.findOne({ where: { id } });
+};
+
+const findNotificationByUserIdAndEnvelopeId = async (
+  notificationRepository: Repository<Notification>,
+  userId: number,
+  envelopeId: string,
+): Promise<Notification | null> => {
+  return await notificationRepository.findOne({
+    relations: ['receiver', 'app'],
+    where: {
+      receiver: { id: userId },
+      envelope_id: envelopeId,
+    },
+  });
+};
+
+const findNotificationsByUserIdAndAppId = async (
+  notificationRepository: Repository<Notification>,
+  userId: number,
+  appId: number,
+): Promise<Notification[]> => {
+  return await notificationRepository.find({
+    relations: ['receiver', 'app'],
+    where: {
+      receiver: { id: userId },
+      app: { id: appId },
+    },
+  });
+};
+
+const getUnsignedNotificationCount = async (
+  notificationRepository: Repository<Notification>,
+  userId: number,
+  appId: number,
+): Promise<number> => {
+  return await notificationRepository
+    .createQueryBuilder('notification')
+    .innerJoin('notification.receiver', 'receiver')
+    .innerJoin('notification.app', 'app')
+    .where('receiver.id = :userId', { userId })
+    .andWhere('app.id = :appId', { appId })
+    .andWhere('notification.is_signed = :falseValue', {
+      falseValue: FALSE_VALUE,
+    })
+    .getCount();
+};
+
+const update = async (
+  notificationRepository: Repository<Notification>,
+  notification: Notification,
+): Promise<Notification> => {
+  return await notificationRepository.save(notification);
+};
+
+const deleteById = async (
+  notificationRepository: Repository<Notification>,
+  id: number,
+): Promise<void> => {
+  await notificationRepository.delete(id);
+};
+
+export default {
+  create,
+  findNotificationById,
+  findNotificationByUserIdAndEnvelopeId,
+  findNotificationsByUserIdAndAppId,
+  getUnsignedNotificationCount,
+  update,
+  deleteById,
+};
+
+
+=== ./private-server\src\api\services\userApplicationService.ts ===
+
+import { Repository } from 'typeorm';
+import { User_Application } from '../../entity/User_Application';
+
+const create = async (
+  userAppRepository: Repository<User_Application>,
+  userApp: User_Application,
+): Promise<User_Application> => {
+  return await userAppRepository.save(userApp);
+};
+
+const findOneById = async (
+  userAppRepository: Repository<User_Application>,
+  id: number,
+): Promise<User_Application | null> => {
+  if (!id) {
+    throw new Error('id is required');
+  }
+
+  return await userAppRepository.findOne({
+    where: { id },
+    relations: ['app', 'user'],
+  });
+};
+
+const findByEmailAndAppId = async (
+  userAppRepository: Repository<User_Application>,
+  email: string,
+  appId: number,
+): Promise<User_Application | null> => {
+  return await userAppRepository.findOne({
+    where: {
+      user: { email },
+      app: { id: appId },
+    },
+    relations: ['app', 'user'],
+  });
+};
+
+const findByUserId = async (
+  userAppRepository: Repository<User_Application>,
+  userId: number,
+): Promise<User_Application[]> => {
+  return await userAppRepository.find({
+    where: { user: { id: userId } },
+    relations: ['app', 'user'],
+  });
+};
+
+const findOneByUserIdAndAppId = async (
+  userAppRepository: Repository<User_Application>,
+  userId: number,
+  appId: number,
+): Promise<User_Application | null> => {
+  return await userAppRepository.findOne({
+    where: {
+      user: { id: userId },
+      app: { id: appId },
+    },
+    relations: ['app', 'user'],
+  });
+};
+
+const update = async (
+  userAppRepository: Repository<User_Application>,
+  userApp: User_Application,
+): Promise<User_Application> => {
+  return await userAppRepository.save(userApp);
+};
+
+const deleteById = async (
+  userAppRepository: Repository<User_Application>,
+  id: number,
+): Promise<void> => {
+  await userAppRepository.delete(id);
+};
+
+export default {
+  create,
+  findOneById,
+  findByUserId,
+  findOneByUserIdAndAppId,
+  findByEmailAndAppId,
+  update,
+  deleteById,
+};
+
+
+=== ./private-server\src\api\services\userService.ts ===
+
+import { Repository } from 'typeorm';
+import { User } from '../../entity/User';
+import { UpdateRequest } from '../models/userModel';
+
+// const userRepository = ServerDB.getRepository(User);
+
+const create = async (
+  userRepository: Repository<User>,
+  user: User,
+): Promise<User> => {
+  return await userRepository.save(user);
+};
+
+const findAll = async (userRepository: Repository<User>): Promise<User[]> => {
+  return await userRepository.find();
+};
+
+const findUserById = async (
+  userRepository: Repository<User>,
+  id: number,
+): Promise<User | null> => {
+  return await userRepository.findOneBy({ id });
+};
+
+const findUserByEmail = async (
+  userRepository: Repository<User>,
+  email: string,
+): Promise<User | null> => {
+  return await userRepository.findOneBy({ email });
+};
+
+const findUserByDeviceToken = async (
+  userRepository: Repository<User>,
+  deviceToken: string,
+): Promise<User | null> => {
+  return await userRepository.findOneBy({ device_token: deviceToken });
+};
+
+const update = async (
+  userRepository: Repository<User>,
+  user: UpdateRequest,
+): Promise<User> => {
+  const updateUser: User = {
+    id: user.id,
+    email: user.email ? user.email : null,
+    device_token: user.deviceToken,
+  };
+  return await userRepository.save(updateUser);
+};
+
+const deleteById = async (
+  userRepository: Repository<User>,
+  id: number,
+): Promise<void> => {
+  await userRepository.delete(id);
+};
+
+export default {
+  create,
+  findAll,
+  findUserById,
+  findUserByEmail,
+  findUserByDeviceToken,
+  update,
+  deleteById,
+};
+
+
+=== ./private-server\src\api\tests\appController.test.ts ===
+
+import { describe, expect, test } from '@jest/globals';
+import appController from '../controllers/appController';
+import { Request, Response } from 'express';
+import applicationService from '../services/applicationService';
+import { Application } from '../../entity/Application';
+
+jest.mock('../services/applicationService');
+
+describe('appController tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {} as Partial<Request>;
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    } as Partial<Response>;
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('findAll should return applications', async () => {
+    const mockApp1 = new Application('mockApp1');
+    const mockApp2 = new Application('mockApp2');
+    const mockApp3 = new Application('mockApp3');
+    const mockResult = [mockApp1, mockApp2, mockApp3];
+
+    (applicationService.findAll as jest.Mock).mockReturnValueOnce(mockResult);
+
+    await appController.findAll(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(mockResult);
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('Some Error 2: The Errorining');
+
+    (applicationService.findAll as jest.Mock).mockRejectedValue(error);
+
+    await appController.findAll(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(
+      `Error getting apps: ${(error as Error).message}`,
+    );
+  });
+});
+
+
+=== ./private-server\src\api\tests\applicationService.test.ts ===
+
+import applicationService from '../services/applicationService';
+import ServerDB from '../../data_source';
+import { Application } from '../../entity/Application';
+
+jest.mock('../../data_source', () => ({
+  __esModule: true,
+  default: {
+    getRepository: jest.fn(),
+  },
+}));
+
+describe('Application Service', () => {
+  let mockAppRepository: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    mockAppRepository = {
+      find: jest.fn(),
+      findOneBy: jest.fn(),
+    };
+
+    (ServerDB.getRepository as jest.Mock).mockReturnValue(mockAppRepository);
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('findAll tests', () => {
+    test('should return a list of applications', async () => {
+      const mockApp1 = new Application('mockApp1');
+      const mockApp2 = new Application('mockApp2');
+      const mockApplications: Application[] = [mockApp1, mockApp2];
+
+      mockAppRepository.find.mockResolvedValue(mockApplications);
+
+      const result = await applicationService.findAll(mockAppRepository);
+
+      expect(result).toEqual(mockApplications);
+      expect(mockAppRepository.find).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findOneById tests', () => {
+    test('should return an application when found', async () => {
+      const mockApp1 = new Application('mockApp1');
+
+      mockAppRepository.findOneBy.mockResolvedValue(mockApp1);
+
+      const result = await applicationService.findOneById(mockAppRepository, 1);
+
+      expect(result).toEqual(mockApp1);
+      expect(mockAppRepository.findOneBy).toHaveBeenCalledWith({ id: 1 });
+      expect(mockAppRepository.findOneBy).toHaveBeenCalledTimes(1);
+    });
+
+    test('should return null when the application is not found', async () => {
+      mockAppRepository.findOneBy.mockResolvedValue(null);
+
+      const result = await applicationService.findOneById(mockAppRepository, 1);
+
+      expect(result).toBeNull();
+      expect(mockAppRepository.findOneBy).toHaveBeenCalledWith({ id: 1 });
+      expect(mockAppRepository.findOneBy).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+
+=== ./private-server\src\api\tests\authController.test.ts ===
+
+import authController from '../controllers/authController';
+import { Request, Response } from 'express';
+import userService from '../services/userService';
+import { User } from '../../entity/User';
+
+jest.mock('../utils/encryption', () => ({
+  hash: jest.fn(() => 'mock-encrypted-email'),
+}));
+jest.mock('crypto', () => {
+  return {
+    randomBytes: jest
+      .fn()
+      .mockReturnValue(Buffer.from('mocked- bytes').toString('base64url')),
+    createHash: jest
+      .fn()
+      .mockReturnValue({
+        update: jest.fn().mockReturnThis,
+        digest: jest.fn().mockReturnValue('mocked-code-challenge'),
+      }),
+  };
+});
+jest.mock('../services/userService');
+jest.mock('../services/notificationService');
+jest.mock('../services/userApplicationService');
+jest.mock('node-fetch');
+global.fetch = jest.fn(() =>
+  Promise.resolve({
+    access_token: 'mock-access-token',
+    refresh_token: 'mock-refresh-token',
+  }),
+) as jest.Mock;
+
+describe('authLogin tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  process.env.ENCRYPTION_KEY = 'mock-encryption-key';
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {
+      headers: { 'device-token': 'mock-device-token' },
+      params: { appId: '1' },
+      session: {
+        codeVerifier: '',
+        deviceToken: '',
+      },
+    } as unknown as Partial<Request>;
+
+    res = {
+      redirect: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+    } as Partial<Response>;
+
+    process.env.DOCUSIGN_APP_INTEGRATION_KEY = 'mock-integration-key';
+    process.env.DOCUSIGN_REDIRECT_URI = 'mock-redirect-uri';
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+
+    process.env.DOCUSIGN_APP_INTEGRATION_KEY = 'mock-integration-key';
+    req.params!.appId = '1';
+    req.headers!['device-token'] = 'mock-device-token';
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 500 if env variables missing', async () => {
+    delete process.env.DOCUSIGN_APP_INTEGRATION_KEY;
+
+    await authController.authLogin(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(
+      'Missing required environment variables',
+    );
+  });
+
+  test('Should return 400 if no appId', async () => {
+    delete req.params!.appId;
+
+    await authController.authLogin(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.send).toHaveBeenCalledWith('No login available for this app');
+  });
+
+  test('Should redirect to Docusign Auth URL when appId is valid', async () => {
+    const expectedAuthUrl = `https://account-d.docusign.com/oauth/auth?response_type=code&client_id=${process.env.DOCUSIGN_APP_INTEGRATION_KEY}&redirect_uri=${encodeURIComponent('mock-redirect-uri')}&scope=${encodeURIComponent('signature%20impersonation')}&code_challenge=${encodeURIComponent('mocked-code-challenge')}&code_challenge_method=S256&state=${req.headers!['device-token']}`;
+
+    await authController.authLogin(req as Request, res as Response);
+
+    expect(res.redirect).toHaveBeenCalledWith(expectedAuthUrl);
+  });
+
+  test('Should store codeVerifier and deviceToken in session', async () => {
+    await authController.authLogin(req as Request, res as Response);
+
+    expect(req.session?.codeVerifier).toBe('bW9ja2VkLSBieXRlcw');
+    expect(req.session?.deviceToken).toBe(
+      req.headers!['device-token'],
+    );
+  });
+});
+
+describe('docusignLoginSuccess Tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  process.env.ENCRYPTION_KEY = 'mock-encryption-key';
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {
+      query: {
+        code: 'mock-code',
+      },
+      session: {
+        codeVerifier: 'mock-verifier',
+        deviceToken: 'mock-device-token',
+      },
+    } as unknown as Partial<Request>;
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+    } as Partial<Response>;
+
+    process.env.DOCUSIGN_APP_INTEGRATION_KEY = 'mock-integration-key';
+    process.env.DOCUSIGN_PKCE_KEY = 'mock-secret-key';
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+
+    req.session!.codeVerifier = 'mock-verifier';
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should throw error if no auth code provided', async () => {
+    delete req.query!.code;
+
+    await expect(
+      authController.docusignLoginSuccess(req as Request, res as Response),
+    ).rejects.toThrow('No auth code provided');
+  });
+
+  test('Should throw error if no device token', async () => {
+    delete req.session?.deviceToken;
+
+    await expect(
+      authController.docusignLoginSuccess(req as Request, res as Response),
+    ).rejects.toThrow('No device token found');
+  });
+
+  test('Should throw error if no codeVerifier', async () => {
+    delete req.session!.codeVerifier;
+
+    await expect(
+      authController.docusignLoginSuccess(req as Request, res as Response),
+    ).rejects.toThrow('No code verifier found');
+  });
+
+  test('Should return and send error if not response.ok', async () => {
+    const error = new Error('JSON response error');
+    (fetch as jest.Mock).mockResolvedValue({
+      ok: false,
+      json: jest.fn().mockRejectedValue(error)
+    });
+
+    await authController.docusignLoginSuccess(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalled();
+    expect(res.send).toHaveBeenCalledWith(`Error getting access token: ${error.message}`);
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('Some error occurs during execution');
+    
+    (fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({
+        access_token: 'mock-access-token',
+        refresh_token: 'mock-refresh-token',
+      })
+    });
+
+    const mockGetDocusignUserInfoAndEnvelopes = jest.fn().mockRejectedValue(error);
+
+    await authController.docusignLoginSuccess(
+      req as Request, 
+      res as Response,
+      mockGetDocusignUserInfoAndEnvelopes 
+    );
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error getting access token: ${(error as Error).message}`);
+  });
+
+  test('Should return 500 and user not found if no user', async () => {
+    (fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({
+        access_token: 'mock-access-token',
+        refresh_token: 'mock-refresh-token',
+      }),
+    });
+
+    const mockGetDocusignUserInfoAndEnvelopes = jest.fn().mockResolvedValue({
+      userInfo: { email: 'tester@testmail.test'},
+      envelopes:  []
+    });
+
+    (userService.findUserByDeviceToken as jest.Mock).mockResolvedValue(null);
+
+    await authController.docusignLoginSuccess(
+      req as Request, 
+      res as Response, 
+      mockGetDocusignUserInfoAndEnvelopes
+    )
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith('Error getting access token: User not found');
+  });
+  
+  test('Should send access and refresh token', async () => {
+    const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+    const mockDocusignAccount = {
+      account_id: 'mock-account-id',
+      is_default: true,
+      account_name: 'mock-account-name',
+      base_uri: 'mock-uri',
+    };
+    const mockDocusignUserInfo = {
+      sub: 'mock-sub',
+      name: 'mock-name',
+      given_name: '',
+      family_name: '',
+      created: '',
+      email: '',
+      accounts: [mockDocusignAccount],
+    };
+
+    (fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({
+        access_token: 'mock-access-token',
+        refresh_token: 'mock-refresh-token',
+      }),
+    });
+
+    const mockGetDocusignUserInfoAndEnvelopes = jest.fn().mockResolvedValue({
+      userInfo: mockDocusignUserInfo,
+      envelopes:  []
+    });
+
+    const mockCreateOrUpdateNotifcationFromEnvelopes = jest.fn().mockResolvedValue(undefined);
+    const mockUpdateUserApplication = jest.fn().mockResolvedValue(undefined);
+
+    (userService.findUserByDeviceToken as jest.Mock).mockResolvedValueOnce(mockUser);
+
+    (userService.update as jest.Mock).mockResolvedValueOnce(mockUser);
+
+    await authController.docusignLoginSuccess(
+      req as Request, 
+      res as Response, 
+      mockGetDocusignUserInfoAndEnvelopes,
+      mockCreateOrUpdateNotifcationFromEnvelopes,
+      mockUpdateUserApplication
+    );
+
+    expect(mockGetDocusignUserInfoAndEnvelopes).toHaveBeenCalledWith('mock-access-token');
+    expect(mockCreateOrUpdateNotifcationFromEnvelopes).toHaveBeenCalled();
+    expect(mockUpdateUserApplication).toHaveBeenCalled();
+    expect(userService.findUserByDeviceToken).toHaveBeenCalled();
+    expect(userService.update).toHaveBeenCalled();
+    expect(res.send).toHaveBeenCalledWith('ログインに成功しました。');
+  });
+});
+
+
+=== ./private-server\src\api\tests\deviceController.test.ts ===
+
+import deviceController from '../controllers/deviceController';
+import { Request, Response } from 'express';
+import { User } from '../../entity/User';
+import userService from '../services/userService';
+
+jest.mock('../utils/encryption', () => ({
+  hash: jest.fn(() => 'mock-encrypted-email'),
+}));
+jest.mock('../services/userService');
+
+describe('Create tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    process.env.ENCRYPTION_KEY = 'mock-encryption-key';
+
+    req = {
+      body: {
+        email: 'tester@testmail.test',
+        deviceToken: 'mock-device-token',
+      },
+    };
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+
+    req.body.deviceToken = 'mock-device-token';
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 400 if no device token', async () => {
+    delete req.body.deviceToken;
+
+    await deviceController.create(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.send).toHaveBeenCalledWith('Missing deviceToken');
+  });
+
+  test('Should create new user', async () => {
+    const mockUser = new User(req.body.email, req.body.deviceToken);
+    const mockResponse = { ...mockUser, id: 1 };
+
+    (userService.create as jest.Mock).mockResolvedValue(mockResponse);
+
+    await deviceController.create(req as Request, res as Response);
+
+    // expect(userService.create).toHaveBeenCalledWith(mockUser);
+    expect(res.send).toHaveBeenCalledWith(mockResponse);
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('some error');
+    (userService.create as jest.Mock).mockRejectedValue(error);
+
+    await deviceController.create(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error creating user: ${error.message}`);
+  });
+});
+
+describe('Update tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  process.env.ENCRYPTION_KEY = 'mock-encryption-key';
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    process.env.ENCRYPTION_KEY = 'mock-encryption-key';
+
+    req = {
+      params: {
+        userId: '1',
+      },
+      body: {
+        email: 'tester@testmail.test',
+        deviceToken: 'new-mock-device-token',
+      },
+    };
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 404 if no user', async () => {
+    (userService.findUserById as jest.Mock).mockResolvedValue(null);
+
+    await deviceController.update(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(res.send).toHaveBeenCalledWith('User not found');
+  });
+
+  test('Should update user', async () => {
+    const mockUser = {
+      id: 1,
+      email: 'tester@testmail.test',
+      deviceToken: 'old-mock-device-token',
+    };
+    const mockUpdatedUser = {
+      id: 1,
+      email: 'tester@testmail.test',
+      deviceToken: 'new-mock-device-token',
+    };
+
+    (userService.findUserById as jest.Mock).mockResolvedValue(mockUser);
+    (userService.update as jest.Mock).mockResolvedValue(mockUpdatedUser);
+
+    await deviceController.update(req as Request, res as Response);
+
+    /*expect(userService.update).toHaveBeenCalledWith({
+      ...mockUpdatedUser
+    });*/
+    expect(res.send).toHaveBeenCalledWith(mockUpdatedUser);
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('some error');
+
+    (userService.update as jest.Mock).mockRejectedValue(error);
+
+    await deviceController.create(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error creating user: ${error.message}`);
+  });
+});
+
+
+=== ./private-server\src\api\tests\notificationController.test.ts ===
+
+import { Application } from '../../entity/Application';
+import { Notification } from '../../entity/Notification';
+import notificationController from '../controllers/notificationController';
+import notificationService from '../services/notificationService';
+import { Request, Response } from 'express';
+import { User } from '../../entity/User';
+
+jest.mock('../utils/encryption', () => ({
+  hash: jest.fn(() => 'mock-encrypted-email'),
+}));
+jest.mock('../services/notificationService');
+jest.mock('../../data_source');
+
+describe('findAllByUserIdAndAppId tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  beforeEach(() => {
+    req = {
+      body: {
+        userId: 1,
+        appId: 1,
+      },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+
+    req.body.appId = 1;
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 400 if no userId or appId', async () => {
+    delete req.body.appId;
+
+    await notificationController.findAllByUserIdAndAppId(
+      req as Request,
+      res as Response,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.send).toHaveBeenCalledWith('Missing required fields');
+  });
+
+  test('Should return notifications', async () => {
+    const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+    const mockApp = new Application('mocked-app');
+    const mockNotif1 = new Notification(
+      'Mock notif 1',
+      'date',
+      0,
+      0,
+      'tester',
+      mockUser,
+      mockApp,
+      'mockNotif1',
+    );
+    const mockNotif2 = new Notification(
+      'Mock notif 2',
+      'date',
+      0,
+      0,
+      'tester',
+      mockUser,
+      mockApp,
+      'mockNotif1',
+    );
+    const mockNotifications = [mockNotif1, mockNotif2];
+
+    (
+      notificationService.findNotificationsByUserIdAndAppId as jest.Mock
+    ).mockResolvedValue(mockNotifications);
+
+    await notificationController.findAllByUserIdAndAppId(
+      req as Request,
+      res as Response,
+    );
+
+    //repository parameter set as undefined as cannot successfully mock to have the check succeed.
+    //TODO mock repository parameter to check it is being passed.
+    expect(
+      notificationService.findNotificationsByUserIdAndAppId,
+    ).toHaveBeenCalledWith(undefined, req.body.userId, req.body.appId);
+    expect(
+      notificationService.findNotificationsByUserIdAndAppId,
+    ).toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith(mockNotifications);
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('mock error');
+
+    (notificationService.findNotificationsByUserIdAndAppId as jest.Mock).mockRejectedValue(error);
+
+    await notificationController.findAllByUserIdAndAppId(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error getting notifications: ${(error as Error).message}`);
+  });
+});
+
+describe('update tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  beforeEach(() => {
+    req = {
+      params: {
+        id: '1',
+      },
+      body: {
+        isRead: 1,
+      },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+
+    req.body.isRead = 1;
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 400 if missing id or isread is null', async () => {
+    req.body.isRead = null;
+
+    await notificationController.update(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.send).toHaveBeenCalledWith('Missing required fields');
+  });
+
+  test('Should return 404 if notification not found', async () => {
+    (notificationService.findNotificationById as jest.Mock).mockResolvedValue(null);
+
+    await notificationController.update(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(res.send).toHaveBeenCalledWith('Notification not found');
+  });
+
+  test('Should update notification and return updated', async () => {
+    const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+    const mockApp = new Application('mocked-app');
+    const mockedOldNotif = new Notification(
+      'Old mock notif 1',
+      'date',
+      0,
+      0,
+      'tester',
+      mockUser,
+      mockApp,
+      'mockNotif1',
+    );
+    const mockedUpdatedNotif = new Notification(
+      'Updated mock notif 1',
+      'date',
+      1,
+      0,
+      'tester',
+      mockUser,
+      mockApp,
+      'mockNotif1',
+    );
+
+    (notificationService.findNotificationById as jest.Mock).mockResolvedValue(mockedOldNotif);
+    (notificationService.update as jest.Mock).mockResolvedValue(mockedUpdatedNotif);
+
+    await notificationController.update(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(mockedUpdatedNotif);
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('another mock error');
+
+    (notificationService.update as jest.Mock).mockRejectedValue(error);
+
+    await notificationController.update(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error updating notification: ${(error as Error).message}`);
+  });
+});
+
+describe('create tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+  const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+  const mockApp = new Application('mocked-app');
+  const mockNotif = new Notification(
+    'Mock notif 1',
+    'date',
+    0,
+    0,
+    'tester',
+    mockUser,
+    mockApp,
+    'mockNotif1',
+  );
+
+  beforeEach(() => {
+    req = {
+      body: {
+        mockNotif,
+      },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+
+    req.body.deviceToken = 'mock-device-token';
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('Create error');
+
+    (notificationService.create as jest.Mock).mockRejectedValue(error);
+
+    await notificationController.create(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error creating notification: ${(error as Error).message}`);
+  });
+
+  test('Should create and return notification', async () => {
+    (notificationService.create as jest.Mock).mockResolvedValue(req.body);
+
+    await notificationController.create(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(req.body);
+  });
+});
+
+describe('findByUserIdAndEnvelopeId tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  beforeEach(() => {
+    req = {
+      body: {
+        userId: 1,
+        envelopeId: 1,
+      },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+
+    req = {
+      body: {
+        userId: 1,
+        envelopeId: 1,
+      },
+    };
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 400 if missing userId or appId', async () => {
+    req.body.envelopeId = null;
+
+    await notificationController.findByUserIdAndEnvelopeId(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.send).toHaveBeenCalledWith('Missing required fields');
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('findNotificationByUserIdAndEnvelopeId error');
+
+    (notificationService.findNotificationByUserIdAndEnvelopeId as jest.Mock).mockRejectedValue(error);
+
+    await notificationController.findByUserIdAndEnvelopeId(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error getting notification: ${(error as Error).message}`);
+  });
+
+  test('Should return notification by userId and envelopeId', async () => {
+    const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+    const mockApp = new Application('mocked-app');
+    const mockNotif = new Notification(
+      'Mock notif 1',
+      'date',
+      0,
+      0,
+      'tester',
+      mockUser,
+      mockApp,
+      'mockNotif1',
+    );
+
+    (notificationService.findNotificationByUserIdAndEnvelopeId as jest.Mock).mockResolvedValue(mockNotif);
+
+    await notificationController.findByUserIdAndEnvelopeId(
+      req as Request,
+      res as Response,
+    );
+
+    expect(res.json).toHaveBeenCalledWith(mockNotif);
+  });
+});
+
+describe('getUnsignedNotificationCount', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  beforeEach(() => {
+    req = {
+      body: {
+        userId: 1,
+        appId: 1,
+      },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+    
+    req = {
+      body: {
+        userId: 1,
+        appId: 1,
+      },
+    };
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 400 if no userId or appId', async () => {
+    req.body.appId = null;
+
+    await notificationController.getUnsignedNotificationCount(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.send).toHaveBeenCalledWith('Missing required fields');
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('getUnsignedNotificationCount error');
+
+    (notificationService.getUnsignedNotificationCount as jest.Mock).mockRejectedValue(error);
+
+    await notificationController.getUnsignedNotificationCount(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error getting notification count: ${(error as Error).message}`);
+  });
+
+  test('Should return notification count', async () => {
+    const mockCount = 12;
+
+    (notificationService.getUnsignedNotificationCount as jest.Mock).mockResolvedValue(mockCount);
+
+    await notificationController.getUnsignedNotificationCount(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(mockCount);
+  });
+});
+
+
+=== ./private-server\src\api\tests\notificationService.test.ts ===
+
+import notificationService from '../services/notificationService';
+import ServerDB from '../../data_source';
+import { Notification } from '../../entity/Notification';
+import { Application } from '../../entity/Application';
+import { User } from '../../entity/User';
+import { DeleteResult } from 'typeorm';
+
+jest.mock('../../data_source', () => ({
+  __esModule: true,
+  default: {
+    getRepository: jest.fn(),
+  },
+}));
+
+describe('Notification service', () => {
+  let mockNotifRepository: any;
+  let mockQueryBuilder: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    mockNotifRepository = {
+      find: jest.fn(),
+      findOne: jest.fn(),
+      save: jest.fn(),
+      createQueryBuilder: jest.fn(() => mockQueryBuilder),
+      delete: jest.fn(),
+    };
+
+    mockQueryBuilder = {
+      innerJoin: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      getCount: jest.fn().mockReturnThis(),
+    };
+
+    (ServerDB.getRepository as jest.Mock).mockReturnValue(mockNotifRepository);
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('create tests', () => {
+    test('Should save and return notification', async () => {
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockApp = new Application('mocked-app');
+      const mockNotif = new Notification(
+        'Mock notif 1',
+        'date',
+        0,
+        0,
+        'tester',
+        mockUser,
+        mockApp,
+        'mockNotif1',
+      );
+
+      mockNotifRepository.save.mockResolvedValue(mockNotif);
+
+      const result = await notificationService.create(
+        mockNotifRepository,
+        mockNotif,
+      );
+
+      expect(result).toEqual(mockNotif);
+      expect(mockNotifRepository.save).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findNotificationById tests', () => {
+    test('Should return Notification by Id', async () => {
+      const mockId = 5;
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockApp = new Application('mocked-app');
+      const mockNotif = new Notification(
+        'Mock notif 1',
+        'date',
+        0,
+        0,
+        'tester',
+        mockUser,
+        mockApp,
+        'mockNotif1',
+      );
+
+      mockNotifRepository.findOne.mockResolvedValue(mockNotif);
+
+      const result = await notificationService.findNotificationById(mockNotifRepository, mockId);
+
+      expect(result).toEqual(mockNotif);
+      expect(mockNotifRepository.findOne).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findNotificationByUserIdAndEnvelopeId tests', () => {
+    test('Should return notification by user and envelope id', async () => {
+      const mockId = 5;
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockApp = new Application('mocked-app');
+      const mockNotif = new Notification(
+        'Mock notif 1',
+        'date',
+        0,
+        0,
+        'tester',
+        mockUser,
+        mockApp,
+        'mockNotif1',
+      );
+
+      mockNotifRepository.findOne.mockResolvedValue(mockNotif);
+
+      const result =
+        await notificationService.findNotificationByUserIdAndEnvelopeId(
+          mockNotifRepository,
+          mockId,
+          mockNotif.envelope_id,
+        );
+
+      expect(result).toEqual(mockNotif);
+      expect(mockNotifRepository.findOne).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findNotificationsByUserIdAndAppId tests', () => {
+    test('Should return notification by user id and app id', async () => {
+      const mockId = 5;
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockApp = new Application('mocked-app');
+      const mockNotif = new Notification(
+        'Mock notif 1',
+        'date',
+        0,
+        0,
+        'tester',
+        mockUser,
+        mockApp,
+        'mockNotif1',
+      );
+
+      mockNotifRepository.find.mockResolvedValue(mockNotif);
+
+      const result =
+        await notificationService.findNotificationsByUserIdAndAppId(
+          mockNotifRepository,
+          mockId,
+          mockApp.id,
+        );
+
+      expect(result).toEqual(mockNotif);
+      expect(mockNotifRepository.find).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('getUnsignedNotificationCount tests', () => {
+    test('Should return notification count', async () => {
+      const mockCount = 4;
+      const mockUserId = 1;
+      const mockAppId = 1;
+
+      mockNotifRepository
+        .createQueryBuilder()
+        .getCount.mockResolvedValue(mockCount);
+
+      const result = await notificationService.getUnsignedNotificationCount(
+        mockNotifRepository,
+        mockUserId,
+        mockAppId,
+      );
+
+      expect(result).toEqual(mockCount);
+    });
+  });
+
+  describe('update tests', () => {
+    test('Should update and return notification', async () => {
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockApp = new Application('mocked-app');
+      const mockNotif = new Notification(
+        'Mock notif 1',
+        'date',
+        0,
+        0,
+        'tester',
+        mockUser,
+        mockApp,
+        'mockNotif1',
+      );
+
+      mockNotifRepository.save.mockResolvedValue(mockNotif);
+
+      const result = await notificationService.update(
+        mockNotifRepository,
+        mockNotif,
+      );
+
+      expect(result).toEqual(mockNotif);
+      expect(mockNotifRepository.save).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('deleteById tests', () => {
+    test('Should delete and remove notification by Id', async () => {
+      const mockId = 1;
+      const mockDelteResult = new DeleteResult();
+
+      mockNotifRepository.delete.mockResolvedValue(mockDelteResult);
+
+      await notificationService.deleteById(mockNotifRepository, mockId);
+
+      expect(mockNotifRepository.delete).toHaveBeenCalledWith(mockId);
+      expect(mockNotifRepository.delete).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+
+=== ./private-server\src\api\tests\userApplicationController.test.ts ===
+
+import userApplicationController from '../controllers/userApplicationController';
+import { Request, Response } from 'express';
+import userApplicationService from '../services/userApplicationService';
+import { User_Application } from '../../entity/User_Application';
+import userService from '../services/userService';
+import applicationService from '../services/applicationService';
+import { User } from '../../entity/User';
+import { Application } from '../../entity/Application';
+
+jest.mock('../utils/encryption', () => ({
+  hash: jest.fn(() => 'mock-encrypted-email'),
+}));
+jest.mock('../services/userService');
+jest.mock('../services/applicationService');
+jest.mock('../services/userApplicationService');
+
+describe('create tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {
+      body: {
+        appId: 'mock-app-id',
+        userId: 'mock-user-id',
+        numOfUnsignedNotif: 4,
+        isLoggedIn: false,
+      },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+
+    req.body.numOfUnsignedNotif = 4;
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 400 if any required params are null', async () => {
+    req.body.numOfUnsignedNotif = null;
+
+    await userApplicationController.create(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.send).toHaveBeenCalledWith(
+      'appId, userId, numOfUnsignedNotif, and isLoggedIn are required',
+    );
+  });
+
+  test('Should return 400 if app has already been added', async () => {
+    const mockApp = new Application('mocked-app');
+    const mockUser = new User('tester@testmail.test', 'mock-device-token');
+    const mockUserApp = new User_Application(mockApp, mockUser, 4, 0);
+
+    (
+      userApplicationService.findOneByUserIdAndAppId as jest.Mock
+    ).mockResolvedValueOnce(mockUserApp);
+
+    await userApplicationController.create(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.send).toHaveBeenCalledWith(
+      'The application has already been added by the user.' +
+        JSON.stringify(mockUserApp.id),
+    );
+  });
+
+  test('Should return 404 if user not found', async () => {
+    (userService.findUserById as jest.Mock).mockResolvedValueOnce(null);
+
+    await userApplicationController.create(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(res.send).toHaveBeenCalledWith('User not found');
+  });
+
+  test('Should return 404 if application not found', async () => {
+    const mockUser = new User('tester@testmail.test', 'mock-device-token');
+
+    (userService.findUserById as jest.Mock).mockResolvedValueOnce(mockUser);
+    (applicationService.findOneById as jest.Mock).mockResolvedValueOnce(null);
+
+    await userApplicationController.create(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(res.send).toHaveBeenCalledWith('Application not found');
+  });
+
+  test('Should create new userApplication and return it', async () => {
+    const mockApp = new Application('mocked-app');
+    const mockUser = new User('tester@testmail.test', 'mock-device-token');
+    const mockUserApp = new User_Application(mockApp, mockUser, 4, 0);
+
+    (userApplicationService.findOneByUserIdAndAppId as jest.Mock).mockResolvedValueOnce(null);
+    (userService.findUserById as jest.Mock).mockResolvedValueOnce(mockUser);
+    (applicationService.findOneById as jest.Mock).mockResolvedValueOnce(mockApp);
+    (userApplicationService.create as jest.Mock).mockResolvedValueOnce(mockUserApp);
+
+    await userApplicationController.create(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(mockUserApp);
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const mockApp = new Application('mocked-app');
+    const mockUser = new User('tester@testmail.test', 'mock-device-token');
+    const error = new Error('mock error again');
+
+    (userApplicationService.findOneByUserIdAndAppId as jest.Mock).mockResolvedValueOnce(null);
+    (userService.findUserById as jest.Mock).mockResolvedValueOnce(mockUser);
+    (applicationService.findOneById as jest.Mock).mockResolvedValueOnce(mockApp,);
+    (userApplicationService.create as jest.Mock).mockRejectedValue(error);
+
+    await userApplicationController.create(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error creating user application: ${(error as Error).message}`);
+  });
+});
+
+describe('findByUserId tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {
+      params: {
+        userId: '1',
+      },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should find user and return it', async () => {
+    const mockApp = new Application('mocked-app');
+    const mockUser = new User('tester@testmail.test', 'mock-device-token');
+    const mockUserApp = new User_Application(mockApp, mockUser, 4, 0);
+
+    (userApplicationService.findByUserId as jest.Mock).mockResolvedValueOnce(mockUserApp);
+
+    await userApplicationController.findByUserId(req as Request,res as Response);
+
+    //expect(userApplicationService.findByUserId).toHaveBeenCalledWith(parseInt(req.params!.userId));
+    expect(res.json).toHaveBeenCalledWith(mockUserApp);
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('yet another mock error');
+
+    (userApplicationService.findByUserId as jest.Mock).mockRejectedValue(error);
+
+    await userApplicationController.findByUserId(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error getting user applications: ${(error as Error).message}`);
+  });
+});
+
+describe('update tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  process.env.ENCRYPTION_KEY = 'mock-encryption-key';
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {
+      params: {
+        id: '5',
+      },
+      body: {
+        numOfUnsignedNotif: '2',
+        isLoggedIn: '0',
+      },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+
+    req.params!.id = '5';
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 400 if no id', async () => {
+    delete req.params!.id;
+
+    await userApplicationController.update(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.send).toHaveBeenCalledWith('Missing required fields');
+  });
+
+  test('Should return 400 if no user application', async () => {
+    (userApplicationService.findOneById as jest.Mock).mockResolvedValueOnce(null);
+
+    await userApplicationController.update(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(res.send).toHaveBeenCalledWith('User application not found');
+  });
+
+  test('Should update user application and return it', async () => {
+    const mockApp = new Application('mocked-app');
+    const mockUser = new User('tester@testmail.test', 'mock-device-token');
+    const mockOldUserApp = new User_Application(mockApp, mockUser, 4, 0);
+    const mockUpdatedUserApp = new User_Application(
+      mockApp,
+      mockUser,
+      req.body.num_of_unsigned_notif,
+      0,
+    );
+
+    (userApplicationService.findOneById as jest.Mock).mockResolvedValueOnce(mockOldUserApp);
+    (userApplicationService.update as jest.Mock).mockResolvedValueOnce(mockUpdatedUserApp);
+
+    await userApplicationController.update(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(mockUpdatedUserApp);
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const mockApp = new Application('mocked-app');
+    const mockUser = new User('tester@testmail.test', 'mock-device-token');
+    const mockUserApp = new User_Application(mockApp, mockUser, 4, 0);
+    const error = new Error('I bet you never expected another mock error');
+
+    (userApplicationService.findOneById as jest.Mock).mockResolvedValueOnce(mockUserApp);
+    (userApplicationService.update as jest.Mock).mockRejectedValue(error);
+
+    await userApplicationController.update(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error updating user application: ${(error as Error).message}`);
+  });
+});
+
+describe('deleteById tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {
+      params: {
+        id: '5',
+      },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should delete user application by id', async () => {
+    (userApplicationService.deleteById as jest.Mock).mockResolvedValueOnce;
+
+    await userApplicationController.deleteById(req as Request, res as Response);
+
+    //expect(userApplicationService.deleteById).toHaveBeenCalledWith(parseInt(req.params!.id));
+    expect(res.send).toHaveBeenCalledWith('User application deleted');
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('Return of the mock error');
+
+    (userApplicationService.deleteById as jest.Mock).mockRejectedValueOnce(error);
+
+    await userApplicationController.deleteById(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error deleting user application: ${(error as Error).message}`);
+  });
+});
+
+describe('findByEmailAndAppId tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  process.env.ENCRYPTION_KEY = 'mock-encryption-key';
+
+  beforeEach(() => {
+    req = {
+      body: {
+        email: 'tester@testmail.test',
+        appId: 1,
+      },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+
+    req.body.appId = 1;
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 400 if no email or appId', async () => {
+    req.body.appId = null;
+
+    await userApplicationController.findByEmailAndAppId(
+      req as Request,
+      res as Response,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.send).toHaveBeenCalledWith('email and appId are required');
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('Another mock error');
+
+    (userApplicationService.findByEmailAndAppId as jest.Mock).mockRejectedValueOnce(error);
+
+    await userApplicationController.findByEmailAndAppId(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error getting user application: ${(error as Error).message}`);
+  });
+
+  test('Should return user application by email and app id', async () => {
+    const mockApp = new Application('mocked-app');
+    const mockUser = new User('tester@testmail.test', 'mock-device-token');
+    const mockUserApp = new User_Application(mockApp, mockUser, 4, 0);
+
+    (userApplicationService.findByEmailAndAppId as jest.Mock).mockResolvedValueOnce(mockUserApp);
+
+    await userApplicationController.findByEmailAndAppId(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(mockUserApp);
+  });
+});
+
+describe('findyByUserIdAndAppId tests', () => {
+  let req: Partial<Request>;
+  let res: Partial<Response>;
+
+  beforeEach(() => {
+    req = {
+      body: {
+        userId: 1,
+        appId: 1,
+      },
+    };
+
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+
+    req.body.appId = 1;
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return 400 if no userId or appId', async () => {
+    req.body.appId = null;
+
+    await userApplicationController.findByUserIdAndAppId(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.send).toHaveBeenCalledWith('userId and appId are required');
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('Not another mock error');
+
+    (userApplicationService.findOneByUserIdAndAppId as jest.Mock).mockRejectedValueOnce(error);
+
+    await userApplicationController.findByUserIdAndAppId(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error getting user application: ${(error as Error).message}`);
+  });
+
+  test('Should return user application by userId and app id', async () => {
+    const mockApp = new Application('mocked-app');
+    const mockUser = new User('tester@testmail.test', 'mock-device-token');
+    const mockUserApp = new User_Application(mockApp, mockUser, 4, 0);
+
+    (userApplicationService.findOneByUserIdAndAppId as jest.Mock).mockResolvedValueOnce(mockUserApp);
+
+    await userApplicationController.findByUserIdAndAppId(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(mockUserApp);
+  });
+});
+
+
+=== ./private-server\src\api\tests\userApplicationService.test.ts ===
+
+import userApplicationService from '../services/userApplicationService';
+import { User_Application } from '../../entity/User_Application';
+import { Application } from '../../entity/Application';
+import { User } from '../../entity/User';
+import ServerDB from '../../data_source';
+import { DeleteResult } from 'typeorm';
+
+jest.mock('../../data_source', () => ({
+  __esModule: true,
+  default: {
+    getRepository: jest.fn(),
+  },
+}));
+
+describe('User application service', () => {
+  let mockUserAppRepository: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    mockUserAppRepository = {
+      find: jest.fn(),
+      findOne: jest.fn(),
+      save: jest.fn(),
+      delete: jest.fn(),
+    };
+
+    (ServerDB.getRepository as jest.Mock).mockReturnValue(
+      mockUserAppRepository,
+    );
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('create tests', () => {
+    test('Should create and return user application', async () => {
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockApp = new Application('mocked-app');
+      const mockUserApp = new User_Application(mockApp, mockUser, 3, 0);
+
+      mockUserAppRepository.save.mockResolvedValue(mockUserApp);
+
+      const result = await userApplicationService.create(mockUserAppRepository, mockUserApp);
+
+      expect(result).toEqual(mockUserApp);
+      expect(mockUserAppRepository.save).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findOneById tests', () => {
+    test('Should throw error if no id', async () => {
+      await expect(userApplicationService.findOneById(
+        mockUserAppRepository,
+        undefined as unknown as number)
+      ).rejects.toThrow('id is required');
+    });
+
+    test('Should return user application by id', async () => {
+      const mockId = 1;
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockApp = new Application('mocked-app');
+      const mockUserApp = new User_Application(mockApp, mockUser, 3, 0);
+
+      mockUserAppRepository.findOne.mockResolvedValue(mockUserApp);
+
+      const result = await userApplicationService.findOneById(mockUserAppRepository, mockId);
+
+      expect(result).toEqual(mockUserApp);
+      expect(mockUserAppRepository.findOne).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findByEmailAndAppId tests', () => {
+    test('Should return user application by email and app id', async () => {
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockApp = new Application('mocked-app');
+      const mockUserApp = new User_Application(mockApp, mockUser, 3, 0);
+
+      mockUserAppRepository.findOne.mockResolvedValue(mockUserApp);
+
+      const result = await userApplicationService.findByEmailAndAppId(
+        mockUserAppRepository,
+        mockUser.email!,
+        mockApp.id,
+      );
+
+      expect(result).toEqual(mockUserApp);
+      expect(mockUserAppRepository.findOne).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findByUserId tests', () => {
+    test('Should return user application by user id', async () => {
+      const mockUserId = 1;
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockApp = new Application('mocked-app');
+      const mockUserApp = new User_Application(mockApp, mockUser, 3, 0);
+
+      mockUserAppRepository.find.mockResolvedValue(mockUserApp);
+
+      const result = await userApplicationService.findByUserId(mockUserAppRepository, mockUserId);
+
+      expect(result).toEqual(mockUserApp);
+      expect(mockUserAppRepository.find).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findOneByUserIdAndAppId', () => {
+    test('Should return user application by user and app id', async () => {
+      const mockUserId = 1;
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockApp = new Application('mocked-app');
+      const mockUserApp = new User_Application(mockApp, mockUser, 3, 0);
+
+      mockUserAppRepository.findOne.mockResolvedValue(mockUserApp);
+
+      const result = await userApplicationService.findOneByUserIdAndAppId(
+        mockUserAppRepository,
+        mockUserId,
+        mockApp.id,
+      );
+
+      expect(result).toEqual(mockUserApp);
+      expect(mockUserAppRepository.findOne).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('update tests', () => {
+    test('Should update and return user application', async () => {
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockApp = new Application('mocked-app');
+      const mockUserApp = new User_Application(mockApp, mockUser, 3, 0);
+
+      mockUserAppRepository.save.mockResolvedValue(mockUserApp);
+
+      const result = await userApplicationService.update(mockUserAppRepository, mockUserApp);
+
+      expect(result).toEqual(mockUserApp);
+      expect(mockUserAppRepository.save).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('deleteById tests', () => {
+    test('Should delete and remove user application by Id', async () => {
+      const mockId = 1;
+      const mockDelteResult = new DeleteResult();
+
+      mockUserAppRepository.delete.mockResolvedValue(mockDelteResult);
+
+      await userApplicationService.deleteById(mockUserAppRepository, mockId);
+
+      expect(mockUserAppRepository.delete).toHaveBeenCalledWith(mockId);
+      expect(mockUserAppRepository.delete).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+
+=== ./private-server\src\api\tests\userController.test.ts ===
+
+import userController from '../controllers/userController';
+import { Request, Response } from 'express';
+import userService from '../services/userService';
+import { User } from '../../entity/User';
+
+jest.mock('../utils/encryption', () => ({
+  hash: jest.fn(() => 'mock-encrypted-email'),
+}));
+jest.mock('../services/userService');
+
+let req: Partial<Request>;
+let res: Partial<Response>;
+
+describe('findAll tests', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {};
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return array of users', async () => {
+    const mockUser1 = new User('mock1', 'mockDeviceToken');
+    const mockUser2 = new User('mock2', 'mockDeviceToken');
+    const mockUser3 = new User('mock3', 'mockDeviceToken');
+
+    const mockResult = [mockUser1, mockUser2, mockUser3];
+
+    (userService.findAll as jest.Mock).mockResolvedValueOnce(mockResult);
+
+    await userController.findAll(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(mockResult);
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('Never too many mock errors');
+
+    (userService.findAll as jest.Mock).mockRejectedValueOnce(error);
+
+    await userController.findAll(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error getting users: ${(error as Error).message}`);
+  });
+});
+
+describe('findOneById tests', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {
+      params: {
+        id: '5',
+      },
+    };
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return user', async () => {
+    const mockUser = new User('mock1', 'mockDeviceToken');
+    (userService.findUserById as jest.Mock).mockResolvedValueOnce(mockUser);
+
+    await userController.findOneById(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(mockUser);
+  });
+
+  test('Should return 404 if no user', async () => {
+    (userService.findUserById as jest.Mock).mockResolvedValueOnce(null);
+
+    await userController.findOneById(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(res.send).toHaveBeenCalledWith('User not found');
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('Another one (error)');
+
+    (userService.findUserById as jest.Mock).mockRejectedValueOnce(error);
+
+    await userController.findOneById(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error getting user: ${(error as Error).message}`);
+  });
+});
+
+describe('deleteById tests', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {
+      params: {
+        id: '5',
+      },
+    };
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should delete user and return "user deleted"', async () => {
+    (userService.deleteById as jest.Mock).mockResolvedValue;
+
+    await userController.deleteById(req as Request, res as Response);
+
+    expect(res.send).toHaveBeenCalledWith('User deleted');
+  });
+
+  test('Should return 500 if error occurs', async () => {
+    const error = new Error('And another one (error)');
+
+    (userService.deleteById as jest.Mock).mockRejectedValueOnce(error);
+
+    await userController.deleteById(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error deleting user: ${(error as Error).message}`);
+  });
+});
+
+describe('findOneByDeviceToken tests', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    req = {
+      body: {
+        email: 'mock-email',
+        deviceToken: 'mock-device-token',
+      },
+    };
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return no user found if no user', async () => {
+    (userService.findUserByDeviceToken as jest.Mock).mockResolvedValue(null);
+
+    await userController.findOneByDeviceToken(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(res.send).toHaveBeenCalledWith('User not found');
+  });
+
+  test('Should throw new error if error occurs', async () => {
+    const error = new Error('One more error');
+
+    (userService.findUserByDeviceToken as jest.Mock).mockRejectedValueOnce(error);
+
+    await userController.findOneByDeviceToken(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error getting user: ${(error as Error).message}`);
+  });
+
+  test('Should return user by device token', async () => {
+    const mockUser = new User('mockUser', 'mockDeviceToken');
+
+    (userService.findUserByDeviceToken as jest.Mock).mockResolvedValue(mockUser);
+
+    await userController.findOneByDeviceToken(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(mockUser);
+  });
+});
+
+describe('findOneByEmail tests', () => {
+  beforeEach(() => {
+    jest.resetModules();
+    jest.clearAllMocks();
+
+    process.env.ENCRYPTION_KEY = 'mock-encryption-key';
+
+    req = {
+      body: {
+        deviceToken: 'mock-device-token',
+      },
+    };
+    res = {
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  test('Should return no user found if no user', async () => {
+    (userService.findUserByEmail as jest.Mock).mockResolvedValue(null);
+
+    await userController.findOneByEmail(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(res.send).toHaveBeenCalledWith('User not found');
+  });
+
+  test('Should throw new error if error occurs', async () => {
+    const error = new Error('One more error');
+
+    (userService.findUserByEmail as jest.Mock).mockRejectedValueOnce(error);
+
+    await userController.findOneByEmail(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.send).toHaveBeenCalledWith(`Error getting user: ${(error as Error).message}`);
+  });
+
+  test('Should return user by email', async () => {
+    const mockUser = new User('mockUser', 'mockDeviceToken');
+
+    (userService.findUserByEmail as jest.Mock).mockResolvedValue(mockUser);
+
+    await userController.findOneByEmail(req as Request, res as Response);
+
+    expect(res.json).toHaveBeenCalledWith(mockUser);
+  });
+});
+
+
+=== ./private-server\src\api\tests\userService.test.ts ===
+
+import userService from '../services/userService';
+import ServerDB from '../../data_source';
+import { User } from '../../entity/User';
+import { UpdateRequest } from '../models/userModel';
+import { DeleteResult } from 'typeorm';
+
+jest.mock('../../data_source', () => ({
+  __esModule: true,
+  default: {
+    getRepository: jest.fn(),
+  },
+}));
+
+describe('User service', () => {
+  let mockUserRepository: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    mockUserRepository = {
+      find: jest.fn(),
+      findOneBy: jest.fn(),
+      save: jest.fn(),
+      delete: jest.fn(),
+    };
+
+    (ServerDB.getRepository as jest.Mock).mockReturnValue(mockUserRepository);
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('create tests', () => {
+    test('Should create and return user', async () => {
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      mockUserRepository.save.mockResolvedValue(mockUser);
+
+      const result = await userService.create(mockUserRepository, mockUser);
+
+      expect(result).toEqual(mockUser);
+      expect(mockUserRepository.save).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findAll tests', () => {
+    test('Should find and return users', async () => {
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      mockUserRepository.find.mockResolvedValue(mockUser);
+
+      const result = await userService.findAll(mockUserRepository);
+
+      expect(result).toEqual(mockUser);
+      expect(mockUserRepository.find).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findUserById tests', () => {
+    test('Should find and return user by id', async () => {
+      const mockId = 1;
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      mockUserRepository.findOneBy.mockResolvedValue(mockUser);
+
+      const result = await userService.findUserById(mockUserRepository, mockId);
+
+      expect(result).toEqual(mockUser);
+      expect(mockUserRepository.findOneBy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findUserByEmail tests', () => {
+    test('Should find and return user by email', async () => {
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      mockUserRepository.findOneBy.mockResolvedValue(mockUser);
+
+      const result = await userService.findUserByEmail(
+        mockUserRepository,
+        mockUser.email!,
+      );
+
+      expect(result).toEqual(mockUser);
+      expect(mockUserRepository.findOneBy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('findUserByDeviceToken tests', () => {
+    test('Should find and return user by device token', async () => {
+      const mockUser = new User('tester@testmail.test', 'mocked-device-token');
+      const mockDeviceToken = 'mocked-device-token';
+      mockUserRepository.findOneBy.mockResolvedValue(mockUser);
+
+      const result = await userService.findUserByDeviceToken(
+        mockUserRepository,
+        mockDeviceToken,
+      );
+
+      expect(result).toEqual(mockUser);
+      expect(mockUserRepository.findOneBy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('update tests', () => {
+    test('Should create and return user', async () => {
+      const mockUser: UpdateRequest = {
+        id: 1,
+        email: 'mockEmail',
+        deviceToken: 'mockDeviceToken',
+      };
+      mockUserRepository.save.mockResolvedValue(mockUser);
+
+      const result = await userService.update(mockUserRepository, mockUser);
+
+      expect(result).toEqual(mockUser);
+      expect(mockUserRepository.save).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('deleteById tests', () => {
+    test('Should find and return user by device token', async () => {
+      const mockId = 1;
+      const mockDelteResult = new DeleteResult();
+
+      mockUserRepository.delete.mockResolvedValue(mockDelteResult);
+
+      await userService.deleteById(mockUserRepository, mockId);
+
+      expect(mockUserRepository.delete).toHaveBeenCalledWith(mockId);
+      expect(mockUserRepository.delete).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+
+=== ./private-server\src\api\utils\encryption.ts ===
+
+import crypto from 'crypto';
+
+const secretKey = process.env.ENCRYPTION_KEY;
+
+export const hash = (data: string): string => {
+  if (!secretKey) {
+    throw new Error('ENCRYPTION_KEY not found in environment variables');
+  }
+
+  const hashedData = crypto
+    .createHmac('sha256', secretKey)
+    .update(data)
+    .digest('hex');
+
+  return hashedData;
+};
+
+
+=== ./private-server\src\entity\Application.ts ===
+
+import { Entity, PrimaryGeneratedColumn, Column } from 'typeorm';
+
+@Entity()
+export class Application {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  app_name: string;
+
+  constructor(app_name: string) {
+    this.app_name = app_name;
+  }
+}
+
+
+=== ./private-server\src\entity\Notification.ts ===
+
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  ManyToOne,
+  JoinColumn,
+} from 'typeorm';
+import { User } from './User';
+import { Application } from './Application';
+
+@Entity()
+export class Notification {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  subject: string;
+
+  @Column()
+  date: string;
+
+  @Column()
+  is_read: number;
+
+  @Column()
+  is_signed: number;
+
+  @Column()
+  sender: string;
+
+  @ManyToOne(() => User)
+  @JoinColumn({ name: 'Receiver' })
+  receiver: User;
+
+  @ManyToOne(() => Application)
+  @JoinColumn({ name: 'App_Id' })
+  app: Application;
+
+  @Column()
+  envelope_id: string;
+
+  constructor(
+    subject: string,
+    date: string,
+    is_read: number,
+    is_signed: number,
+    sender: string,
+    receiver: User,
+    app: Application,
+    envelope_id: string,
+  ) {
+    this.subject = subject;
+    this.date = date;
+    this.is_read = is_read;
+    this.is_signed = is_signed;
+    this.sender = sender;
+    this.receiver = receiver;
+    this.app = app;
+    this.envelope_id = envelope_id;
+  }
+}
+
+
+=== ./private-server\src\entity\User.ts ===
+
+import { Entity, PrimaryGeneratedColumn, Column } from 'typeorm';
+
+@Entity()
+export class User {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column({ type: 'text', nullable: true })
+  email: string | null;
+
+  @Column()
+  device_token: string;
+
+  constructor(email: string | null = null, device_token: string) {
+    this.email = email;
+    this.device_token = device_token;
+  }
+}
+
+
+=== ./private-server\src\entity\User_Application.ts ===
+
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  ManyToOne,
+  JoinColumn,
+} from 'typeorm';
+import { Application } from './Application';
+import { User } from './User';
+
+@Entity()
+export class User_Application {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @ManyToOne(() => Application)
+  @JoinColumn({ name: 'App_Id' })
+  app: Application;
+
+  @ManyToOne(() => User)
+  @JoinColumn({ name: 'User_Id' })
+  user: User;
+
+  @Column()
+  num_of_unsigned_notif: number;
+
+  @Column()
+  is_logged_in: number;
+
+  constructor(
+    app: Application,
+    user: User,
+    num_of_unsigned_notif: number,
+    is_logged_in: number,
+  ) {
+    this.app = app;
+    this.user = user;
+    this.num_of_unsigned_notif = num_of_unsigned_notif;
+    this.is_logged_in = is_logged_in;
+  }
+}
+
+
+=== ./public-server\src\server.ts ===
+
+import dotenv from 'dotenv';
+
+dotenv.config({ path: `.env.${process.env.NODE_ENV || 'development'}` });
+
+import fs from 'fs';
+import https from 'https';
+import express, { Application, Request, Response } from 'express';
+import 'reflect-metadata';
+import routes from './api/routes/routes';
+
+const app: Application = express();
+const port = 443;
+
+app.use(express.json());
+
+const options: { key: Buffer; cert: Buffer; passphrase?: string } = {
+  key: fs.readFileSync(process.env.KEY_FILE_PATH || ''),
+  cert: fs.readFileSync(process.env.CERT_FILE_PATH || ''),
+};
+
+if (process.env.NODE_ENV !== 'production') {
+  options.passphrase = process.env.CERT_PASSPHRASE;
+}
+
+app.use('/', routes);
+
+app.get('/', (_: Request, res: Response) => {
+  res.send('Hello, TypeScript + Node.js + Express!');
+});
+
+https.createServer(options, app).listen(port, () => {
+  console.log(`HTTPS server is running on port ${port}`);
+});
+
+
+=== ./public-server\src\api\controllers\nodeApnController.ts ===
+
+import apn from 'apn';
+import { Notification } from '../../entity/Notification';
+
+const keyPath = process.env.APN_KEY ?? '';
+const keyId = process.env.APN_KEY_ID ?? '';
+const teamId = process.env.APN_TEAM_ID ?? '';
+const bundleId = process.env.APN_BUNDLE_ID ?? '';
+
+const options = {
+  token: { key: keyPath, keyId: keyId, teamId: teamId },
+  production: process.env.NODE_ENV === 'production',
+};
+
+if (!options.token.key || !options.token.keyId || !options.token.teamId) {
+  throw new Error('One or more APN token fields are missing.');
+}
+
+const apnProvider = new apn.Provider(options);
+
+const sendNotification = async (
+  notification: Notification,
+  deviceToken: string,
+  num_of_unsigned_notif: number,
+) => {
+
+
+  if (notification && apnProvider) {
+    const notif = new apn.Notification({
+      alert: `${notification.sender}さんから${notification.subject}の承認依頼が届きました。`,
+      body: `${notification.sender}さんから${notification.subject}の承認依頼が届きました。`,
+      date: notification.date,
+      topic: bundleId,
+      badge: num_of_unsigned_notif,
+      payload: {
+        from: 'approveHub, using node-apn',
+        source: 'approveHub server',
+      },
+    });
+
+    await apnProvider.send(notif, deviceToken);
+  }
+};
+
+export default { sendNotification };
+
+
+=== ./public-server\src\api\controllers\webhookController.ts ===
+
+import { Request, Response } from 'express';
+import crypto from 'crypto';
+import { AxiosResponse } from 'axios';
+import { Notification } from '../../entity/Notification';
+import { User_Application } from '../../entity/User_Application';
+import nodeApnController from './nodeApnController';
+import { makeAxiosRequest } from '../utils/axiosRequest';
+
+console.log(process.env.DOCUSIGN_HMAC_TOKEN);
+
+const docusignNotification = async (req: Request, res: Response) => {
+  console.log('Received docusign notification');
+  const DOCUSIGN_ID: number = 1;
+  const FALSE_VALUE: number = 0;
+  const TRUE_VALUE: number = 1;
+
+  const computeHash = (payload: string, secret: string) => {
+    const hmac = crypto.createHmac('sha256', secret);
+    hmac.write(payload);
+    hmac.end();
+    return hmac.read().toString('base64');
+  };
+
+  const isHashValid = (payload: string, verify: string, secret: string) => {
+    return crypto.timingSafeEqual(
+      Buffer.from(verify, 'base64'),
+      Buffer.from(computeHash(payload, secret), 'base64'),
+    );
+  };
+
+  try {
+    const payload = req.body;
+    const verify = req.headers['x-docusign-signature-1']?.toString();
+    const secret = process.env.DOCUSIGN_HMAC_TOKEN?.toString();
+
+    if (!secret) {
+      res.status(500).send('DOCUSIGN_HMAC_TOKEN not found');
+      return;
+    } else if (!verify) {
+      res.status(500).send('x-docusign-signature-1 not found');
+      return;
+    }
+
+    const isHmacValid = isHashValid(JSON.stringify(payload), verify, secret);
+
+    if (!isHmacValid) {
+      res.status(500).send('Invalid key');
+      return;
+    }
+
+    const splitSubject = payload.data.envelopeSummary.emailSubject.split(': ');
+    const subject = splitSubject.length > 1 ? splitSubject[1] : payload.data.envelopeSummary.emailSubject;
+    const date = payload.generatedDateTime;
+    const sender =
+      payload.data.envelopeSummary.sender.userName ||
+      payload.data.envelopeSummary.sender.email;
+    const envelopeId = payload.data.envelopeId;
+
+    const recipients = payload.data.envelopeSummary.recipients.signers;
+    for (const recipient of recipients) {
+      const { email } = recipient;
+
+      const userApplication: AxiosResponse<User_Application> =
+        await makeAxiosRequest('userApplications/findByEmailAndAppId', 'post', {
+          email,
+          appId: DOCUSIGN_ID,
+        });
+
+      if (!userApplication.data) continue;
+
+      let userApplicationData = {
+        app: userApplication.data.app,
+        id: userApplication.data.id,
+        isLoggedIn: userApplication.data.is_logged_in,
+        numOfUnsignedNotif: userApplication.data.num_of_unsigned_notif,
+        user: userApplication.data.user,
+      };
+
+      let notification: Notification | null = null;
+
+      if (payload.event === 'envelope-sent') {
+        notification = new Notification(
+          subject,
+          date,
+          FALSE_VALUE,
+          FALSE_VALUE,
+          sender,
+          userApplicationData.user,
+          userApplicationData.app,
+          envelopeId,
+        );
+
+        await makeAxiosRequest('notifications/create', 'post', notification);
+
+        userApplicationData.numOfUnsignedNotif += 1;
+
+        try {
+          await nodeApnController.sendNotification(
+            notification,
+            userApplicationData.user.device_token,
+            userApplicationData.numOfUnsignedNotif,
+          );
+        } catch (error) {
+          throw new Error(
+            `Error sending APN notification: ${(error as Error).message}`,
+          );
+        }
+      } else if (payload.event === 'recipient-completed') {
+        const notificationResponse: AxiosResponse<Notification> =
+          await makeAxiosRequest(
+            'notifications/findByUserIdAndEnvelopeId',
+            'post',
+            {
+              userId: userApplicationData.user.id,
+              envelopeId,
+            },
+          );
+
+        if (!notificationResponse.data) continue;
+
+        let notificationData = {
+          app: notificationResponse.data.app,
+          date: notificationResponse.data.date,
+          envelope_id: notificationResponse.data.envelope_id,
+          id: notificationResponse.data.id,
+          isRead: notificationResponse.data.is_read,
+          isSigned: TRUE_VALUE,
+          receiver: notificationResponse.data.receiver,
+          sender: notificationResponse.data.sender,
+          subject: notificationResponse.data.subject,
+        };
+
+        const updatedNotification: AxiosResponse<Notification> =
+          await makeAxiosRequest(
+            `notifications/update/${notificationData.id}`,
+            'put',
+            notificationData,
+          );
+        notification = updatedNotification.data;
+
+        userApplicationData.numOfUnsignedNotif -= 1;
+      }
+
+      await makeAxiosRequest(
+        `userApplications/update/${userApplication.data.id}`,
+        'put',
+        userApplicationData,
+      );
+    }
+
+    res.status(200).send('Success');
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error processing JSON from webhook: ${(error as Error).message}`);
+  }
+};
+
+export default {
+  docusignNotification,
+};
+
+
+=== ./public-server\src\api\routes\routes.ts ===
+
+import express, { Router } from 'express';
+import webhookRoutes from './webhookRoutes';
+
+const router: Router = express.Router();
+
+router.use('/webhooks', webhookRoutes);
+
+export default router;
+
+
+=== ./public-server\src\api\routes\webhookRoutes.ts ===
+
+import express, { Router } from 'express';
+import webhookController from '../controllers/webhookController';
+
+const router: Router = express.Router();
+
+router.post('/docusign', webhookController.docusignNotification);
+
+export default router;
+
+
+=== ./public-server\src\api\tests\webhookController.test.ts ===
+
+// import { describe, expect, test } from '@jest/globals';
+// import webhookController from '../controllers/webhookController';
+
+// describe('webhookController', () => {
+//   test('webhookTestAPI', () => {
+//     // expect(webhookController.webhookTestAPI).toBeDefined();
+//   });
+// });
+
+
+=== ./public-server\src\api\utils\axiosRequest.ts ===
+
+import axios, { AxiosResponse, AxiosRequestConfig } from 'axios';
+
+export async function makeAxiosRequest<T>(
+  url: string,
+  method: 'get' | 'post' | 'put',
+  data?: object,
+  config?: AxiosRequestConfig,
+): Promise<AxiosResponse<T>> {
+  const PRIVATE_URL = process.env.PRIVATE_URL || 'http://localhost';
+
+  try {
+    const response = await axios({
+      url: `${PRIVATE_URL}/${url}`,
+      method,
+      data,
+      ...config,
+    });
+    return response;
+  } catch (error) {
+    console.error('Error in axios request:', error);
+    throw error;
+  }
+}
+
+
+=== ./public-server\src\entity\Application.ts ===
+
+import { Entity, PrimaryGeneratedColumn, Column } from 'typeorm';
+
+@Entity()
+export class Application {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  app_name: string;
+
+  constructor(app_name: string) {
+    this.app_name = app_name;
+  }
+}
+
+
+=== ./public-server\src\entity\Notification.ts ===
+
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  ManyToOne,
+  JoinColumn,
+} from 'typeorm';
+import { User } from './User';
+import { Application } from './Application';
+
+@Entity()
+export class Notification {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  subject: string;
+
+  @Column()
+  date: string;
+
+  @Column()
+  is_read: number;
+
+  @Column()
+  is_signed: number;
+
+  @Column()
+  sender: string;
+
+  @ManyToOne(() => User)
+  @JoinColumn({ name: 'Receiver' })
+  receiver: User;
+
+  @ManyToOne(() => Application)
+  @JoinColumn({ name: 'App_Id' })
+  app: Application;
+
+  @Column()
+  envelope_id: string;
+
+  constructor(
+    subject: string,
+    date: string,
+    is_read: number,
+    is_signed: number,
+    sender: string,
+    receiver: User,
+    app: Application,
+    envelope_id: string,
+  ) {
+    this.subject = subject;
+    this.date = date;
+    this.is_read = is_read;
+    this.is_signed = is_signed;
+    this.sender = sender;
+    this.receiver = receiver;
+    this.app = app;
+    this.envelope_id = envelope_id;
+  }
+}
+
+
+=== ./public-server\src\entity\User.ts ===
+
+import { Entity, PrimaryGeneratedColumn, Column } from 'typeorm';
+
+@Entity()
+export class User {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column({ type: 'text', nullable: true })
+  email: string | null;
+
+  @Column()
+  device_token: string;
+
+  constructor(email: string | null = null, device_token: string) {
+    this.email = email;
+    this.device_token = device_token;
+  }
+}
+
+
+=== ./public-server\src\entity\User_Application.ts ===
+
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  ManyToOne,
+  JoinColumn,
+} from 'typeorm';
+import { Application } from './Application';
+import { User } from './User';
+
+@Entity()
+export class User_Application {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @ManyToOne(() => Application)
+  @JoinColumn({ name: 'App_Id' })
+  app: Application;
+
+  @ManyToOne(() => User)
+  @JoinColumn({ name: 'User_Id' })
+  user: User;
+
+  @Column()
+  num_of_unsigned_notif: number;
+
+  @Column()
+  is_logged_in: number;
+
+  constructor(
+    app: Application,
+    user: User,
+    num_of_unsigned_notif: number,
+    is_logged_in: number,
+  ) {
+    this.app = app;
+    this.user = user;
+    this.num_of_unsigned_notif = num_of_unsigned_notif;
+    this.is_logged_in = is_logged_in;
+  }
+}

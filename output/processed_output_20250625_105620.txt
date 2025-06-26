@@ -1,0 +1,441 @@
+
+## Chunk 1
+# {iphone-app-notification} Project Specification
+
+## Overview
+
+This project implements a secure notification system that processes DocuSign webhook events and sends Apple Push Notifications (APNs) to mobile clients. The system consists of a Node.js server that handles HTTPS traffic (port 443), validates DocuSign webhook signatures, processes envelope events, and sends notifications via APNs.
+
+## Server Requirements
+
+The server requires the following environment variables:
+
+```typescript
+interface ServerConfig {
+  NODE_ENV: 'development' | 'production';
+  KEY_FILE_PATH: string;
+  CERT_FILE_PATH: string;
+  CERT_PASSPHRASE?: string;
+  APN_KEY: string;
+  APN_KEY_ID: string;
+  APN_TEAM_ID: string;
+  APN_BUNDLE_ID: string;
+  DOCUSIGN_HMAC_TOKEN: string;
+}
+```
+
+## API Endpoints
+
+### Webhook Endpoint
+
+**Path:** `/webhooks/docusign`
+**Method:** `POST`
+**Description:** Receives DocuSign webhook notifications and processes envelope events (envelope-sent, recipient-completed)
+
+**Request Format:**
+```typescript
+interface DocuSignWebhookPayload {
+  event: 'envelope-sent' | 'recipient-completed';
+  data: {
+    envelopeSummary: {
+      emailSubject: string;
+      sender: {
+        userName?: string;
+        email?: string;
+      };
+    };
+    envelopeId: string;
+    generatedDateTime: string;
+  };
+}
+```
+
+**Response Format:**
+```typescript
+interface WebhookResponse {
+  status: 'success' | 'error';
+  message?: string;
+  details?: any;
+}
+```
+
+#### Example Request Body (envelope-sent event):
+```json
+{
+  "event": "envelope-sent",
+  "data": {
+    "envelopeSummary": {
+      "emailSubject": "Contract: 12345: John Doe",
+      "sender": {
+        "userName": "Acme Corp",
+        "email": "notifier@acme.com"
+      }
+    },
+    "envelopeId": "d8276f8a-1a8c-4f3d-8a9b-c0d0e1f2a3b4",
+    "generatedDateTime": "2023-10-15T14:30:00Z"
+  }
+}
+```
+
+#### Example Response (success):
+```json
+{
+  "status": "success",
+  "message": "Webhook processed successfully"
+}
+```
+
+### APN Service
+
+**Description:** The system includes a notification service that sends APNs using the node-apn library. This service is called by the webhook endpoint when a new envelope is sent.
+
+**Key Configuration Parameters:**
+```typescript
+interface APNConfig {
+  key: string;          // Path to APN private key
+  keyId: string;        // APN Key ID
+  teamId: string;       // Apple Team ID
+  bundleId: string;     // App Bundle ID
+  production: boolean;  // APN environment (true for production)
+}
+```
+
+**Notification Format:**
+```typescript
+interface APNNotification {
+  alert: string;
+  body: string;
+  date: string;
+  topic: string;
+  badge: number;
+  payload: {
+    from: string;
+    source: string;
+  };
+}
+```
+
+## Security Considerations
+
+1. **HTTPS:** All communication is secured using TLS/SSL with certificate-based authentication
+2. **Webhook Signature Validation:**
+   - Uses HMAC-SHA256 algorithm
+   - Verifies webhook signatures using DocuSign HMAC token
+   ```typescript
+   const isHashValid = (payload: string, verify: string, secret: string) => {
+     return crypto.timingSafeEqual(
+       Buffer.from(verify, 'base64'),
+       Buffer.from(computeHash(payload, secret), 'base64'),
+     );
+   };
+   ```
+3. **Environment Variables:** Sensitive configuration should be managed via environment variables
+
+## Implementation Notes
+
+The system consists of several key components:
+
+1. **HTTPS Server:** Handles secure communication and routes requests to appropriate endpoints
+2. **Webhook Controller:** Processes DocuSign events and triggers notifications
+3. **APN Controller:** Manages APNs sending functionality
+4. **Route Configuration:** Defines the webhook endpoint
+
+The system is designed to:
+- Increment notification counts when new envelopes are created
+- Decrement notification counts when envelopes are completed
+- Send push notifications to registered devices
+- Maintain secure communication channels
+- Validate all incoming webhook requests
+
+## Usage
+
+To run the server in production:
+```bash
+NODE_ENV=production node server.js
+```
+
+For development:
+```bash
+NODE_ENV=development node server.js
+```
+
+The server will listen on port 443 and process incoming webhook requests.
+
+## Chunk 2
+# **{iphone-app-notification} Project Specification**
+
+## **Overview**
+This document outlines the backend API specification for the {iphone-app-notification} project. The API manages user notifications, application associations, and user devices for an iPhone application. It includes REST endpoints for CRUD operations on entities, notification handling, and webhook integration.
+
+## **Endpoints**
+
+### **1. Send Notification**
+- **URL**: `/api/notification/send`
+- **Method**: `POST`
+- **Description**: Send a notification to a specific user or application
+- **Request Format**:
+  ```typescript
+  {
+    "subject": "string",
+    "date": "string",
+    "is_read": 0 | 1,
+    "is_signed": 0 | 1,
+    "sender": "string",
+    "receiver": "user-id",
+    "app": "application-id",
+    "envelope_id": "string",
+    "device_token": "string", // Target device token
+    "target_type": "user" | "application"
+  }
+  ```
+- **Response Format**:
+  ```typescript
+  {
+    "success": true,
+    "message": "Notification sent successfully",
+    "data": {
+      "notification_id": "number"
+    }
+  }
+  ```
+
+### **2. Get Notification List**
+- **URL**: `/api/notification/list`
+- **Method**: `GET`
+- **Query Parameters**:
+  - `user_id` (optional): Filter notifications for a specific user
+  - `app_id` (optional): Filter notifications for a specific application
+- **Response Format**:
+  ```typescript
+  {
+    "success": true,
+    "message": "Notification list retrieved",
+    "data": [
+      {
+        "id": "number",
+        "subject": "string",
+        "date": "string",
+        "is_read": 0 | 1,
+        "is_signed": 0 | 1,
+        "sender": "string",
+        "receiver": "user-id",
+        "app": "application-id",
+        "envelope_id": "string",
+        "read_at": "timestamp | null"
+      }
+    ]
+  }
+  ```
+
+### **3. Mark Notification as Read**
+- **URL**: `/api/notification/mark-as-read/{id}`
+- **Method**: `PUT`
+- **Request Format**:
+  ```typescript
+  {
+    "read_at": "timestamp"
+  }
+  ```
+- **Response Format**:
+  ```typescript
+  {
+    "success": true,
+    "message": "Notification marked as read"
+  }
+  ```
+
+### **4. Get Unread Count**
+- **URL**: `/api/notification/unread-count`
+- **Method**: `GET`
+- **Query Parameters**:
+  - `user_id` (optional): Get unread count for a specific user
+- **Response Format**:
+  ```typescript
+  {
+    "success": true,
+    "message": "Unread count retrieved",
+    "data": {
+      "count": "number"
+    }
+  }
+  ```
+
+### **5. Webhook Endpoint**
+- **URL**: `/api/webhook`
+- **Method**: `POST`
+- **Description**: Handles incoming webhook events from external services
+- **Request Format** (example for notification delivery confirmation):
+  ```typescript
+  {
+    "event": "notification_delivered",
+    "data": {
+      "notification_id": "number",
+      "status": "delivered" | "failed"
+    }
+  }
+  ```
+- **Response Format**:
+  ```typescript
+  {
+    "success": true,
+    "message": "Webhook processed successfully"
+  }
+  ```
+
+### **6. Get Device Token**
+- **URL**: `/api/user/device-token`
+- **Method**: `GET`
+- **Query Parameters**:
+  - `user_id` (required): Retrieve device token for a specific user
+- **Response Format**:
+  ```typescript
+  {
+    "success": true,
+    "message": "Device token retrieved",
+    "data": {
+      "device_token": "string"
+    }
+  }
+  ```
+
+## **Entities**
+
+### **1. Notification**
+```typescript
+@Entity()
+export class Notification {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  subject: string;
+
+  @Column()
+  date: string;
+
+  @Column()
+  is_read: number;
+
+  @Column()
+  is_signed: number;
+
+  @Column()
+  sender: string;
+
+  @ManyToOne(() => User)
+  @JoinColumn({ name: 'Receiver' })
+  receiver: User;
+
+  @ManyToOne(() => Application)
+  @JoinColumn({ name: 'App_Id' })
+  app: Application;
+
+  @Column()
+  envelope_id: string;
+}
+```
+
+### **2. User**
+```typescript
+@Entity()
+export class User {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column({ type: 'text', nullable: true })
+  email: string | null;
+
+  @Column()
+  device_token: string;
+
+  constructor(email: string | null = null, device_token: string) {
+    this.email = email;
+    this.device_token = device_token;
+  }
+}
+```
+
+### **3. Application**
+```typescript
+@Entity()
+export class Application {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  app_name: string;
+
+  constructor(app_name: string) {
+    this.app_name = app_name;
+  }
+}
+```
+
+### **4. User_Application**
+```typescript
+@Entity()
+export class User_Application {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @ManyToOne(() => Application)
+  @JoinColumn({ name: 'App_Id' })
+  app: Application;
+
+  @ManyToOne(() => User)
+  @JoinColumn({ name: 'User_Id' })
+  user: User;
+
+  @Column()
+  num_of_unsigned_notif: number;
+
+  @Column()
+  is_logged_in: number;
+
+  constructor(
+    app: Application,
+    user: User,
+    num_of_unsigned_notif: number,
+    is_logged_in: number,
+  ) {
+    this.app = app;
+    this.user = user;
+    this.num_of_unsigned_notif = num_of_unsigned_notif;
+    this.is_logged_in = is_logged_in;
+  }
+}
+```
+
+## **Error Handling**
+- **Status Codes**:
+  - `200 OK`: Successful request
+  - `400 Bad Request`: Invalid input data
+  - `401 Unauthorized`: Authentication required
+  - `404 Not Found`: Resource not found
+  - `500 Internal Server Error`: Server-side error
+- **Error Response Format**:
+  ```typescript
+  {
+    "success": false,
+    "message": "Error description",
+    "errors": {
+      "field": "Validation error message"
+    }
+  }
+  ```
+
+## **Security**
+- All endpoints require authentication (JWT token in header)
+- **Request Header**: `Authorization: Bearer <JWT_TOKEN>`
+- Input validation for all request parameters
+- Sanitization of user inputs to prevent SQL injection
+
+## **Versioning**
+- API versioning follows `v1` format
+- Example URL: `/api/v1/notification/send`
+
+## **Documentation**
+- Swagger documentation available at `/api/v1/docs`
+- OpenAPI specification at `/api/v1/spec.json`
+
+This specification covers the core functionality needed for a mobile notification system. The API is designed with REST principles and follows standard HTTP conventions.

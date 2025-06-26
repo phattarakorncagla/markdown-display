@@ -1,0 +1,164 @@
+
+## Chunk 1
+# {iphone-app-notification} Specification Document
+
+## Overview
+
+This document describes the {iphone-app-notification} server project, which handles push notifications for an iPhone application. The server receives webhook notifications from DocuSign and sends corresponding push notifications to users' devices using Apple Push Notification Service (APNS).
+
+## Configuration
+
+The server requires the following environment variables to be set:
+
+```bash
+# In .env file
+NODE_ENV=production (or 'development')
+KEY_FILE_PATH=path/to/private/key.p8
+CERT_FILE_PATH=path/to/certificate.pem
+APN_KEY_ID=your_key_id
+APN_TEAM_ID=your_team_id
+APN_BUNDLE_ID=your_bundle_id
+CERT_PASSPHRASE=optional_passphrase
+```
+
+## Endpoints
+
+### 1. Root Endpoint
+
+**GET /**
+
+- **Description**: Basic health check endpoint
+- **Response**:
+  ```json
+  {
+    "message": "Hello, TypeScript + Node.js + Express!"
+  }
+  ```
+- **Status**: 200 OK
+
+### 2. DocuSign Webhook Endpoint
+
+**POST /webhooks/docusign**
+
+- **Description**: Receives DocuSign webhook notifications and sends corresponding push notifications
+- **Request Body**:
+  ```json
+  {
+    "event": "envelope-sent" or "recipient-completed",
+    "data": {
+      "envelopeSummary": {
+        "emailSubject": "string",
+        "sender": {
+          "userName": "string",
+          "email": "string"
+        }
+      },
+      "envelopeId": "string",
+      "generatedDateTime": "string"
+    }
+  }
+  ```
+- **Headers**:
+  - `X-Docusign-Signature-1`: Required for HMAC verification
+- **Response**:
+  ```json
+  {
+    "message": "Success"
+  }
+  ```
+- **Status**: 200 OK on success, 500 on error
+
+## APN Notification Service
+
+### Functionality
+
+The server uses the `node-apn` library to send push notifications. When a DocuSign event occurs (either envelope sent or recipient completed), the system:
+
+1. Creates a new notification record
+2. Updates user application status
+3. Sends push notification to the user's device
+
+### Notification Payload
+
+```typescript
+{
+  alert: `${notification.sender}さんから${notification.subject}の承認依頼が届きました。`,
+  body: `${notification.sender}さんから${notification.subject}の承認依頼が届きました。`,
+  date: notification.date,
+  topic: bundleId,
+  badge: num_of_unsigned_notif,
+  payload: {
+    from: 'approveHub, using node-apn',
+    source: 'approveHub server'
+  }
+}
+```
+
+## Error Handling
+
+The server provides detailed error messages for common failure scenarios:
+
+- Missing APN configuration
+- Invalid webhook signature
+- Failed notification delivery
+- Database communication errors
+
+## Deployment
+
+The server should be deployed with:
+- SSL certificate configured
+- Environment variables properly set
+- Adequate logging and monitoring
+
+## Security Considerations
+
+- Webhook endpoint uses HMAC signature verification
+- HTTPS protocol used for all communications
+- Environment variables should be kept secure
+- Input validation for webhook requests
+
+## Conclusion
+
+This specification covers the core functionality of the {iphone-app-notification} server. The system is designed to reliably receive DocuSign notifications and deliver corresponding push messages to users' devices.
+
+## Chunk 2
+To write a test for the `webhookController`, we need to ensure the controller's methods are properly defined and functional. Here's how to structure the test:
+
+```typescript
+import { describe, expect, test } from '@jest/globals';
+import webhookController from '../controllers/webhookController';
+
+describe('webhookController', () => {
+  test('should have defined webhookTestAPI method', () => {
+    expect(webhookController.webhookTestAPI).toBeDefined();
+  });
+
+  test('should handle webhook events correctly', async () => {
+    // Mock the axios request utility
+    const mockAxiosRequest = jest.fn().mockImplementation(() => ({
+      data: { success: true },
+    }));
+    const originalMakeAxiosRequest = webhookController.makeAxiosRequest;
+    webhookController.makeAxiosRequest = mockAxiosRequest;
+
+    // Call the webhook method
+    const result = await webhookController.webhookTestAPI();
+
+    // Assertions
+    expect(mockAxiosRequest).toHaveBeenCalled();
+    expect(result).toBeDefined();
+    expect(result).toHaveProperty('success', true);
+  });
+});
+```
+
+**Explanation:**
+
+1. **Import Dependencies:** Use Jest's testing utilities and import the controller.
+2. **Test Method Definition:** Verify `webhookTestAPI` exists.
+3. **Functional Test:** 
+   - Mock `makeAxiosRequest` to simulate API calls.
+   - Call `webhookTestAPI` and check if it processes the response correctly.
+   - Ensure the method interacts with the mocked utility and returns expected results.
+
+**Note:** This test assumes `webhookController` uses `makeAxiosRequest` from `./utils/axiosRequest`. Adjust mocks based on actual controller implementation.

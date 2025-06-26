@@ -1,0 +1,462 @@
+
+=== ./public-server/src/server.ts ===
+
+import dotenv from 'dotenv';
+
+dotenv.config({ path: `.env.${process.env.NODE_ENV || 'development'}` });
+
+import fs from 'fs';
+import https from 'https';
+import express, { Application, Request, Response } from 'express';
+import 'reflect-metadata';
+import routes from './api/routes/routes';
+
+const app: Application = express();
+const port = 443;
+
+app.use(express.json());
+
+const options: { key: Buffer; cert: Buffer; passphrase?: string } = {
+  key: fs.readFileSync(process.env.KEY_FILE_PATH || ''),
+  cert: fs.readFileSync(process.env.CERT_FILE_PATH || ''),
+};
+
+if (process.env.NODE_ENV !== 'production') {
+  options.passphrase = process.env.CERT_PASSPHRASE;
+}
+
+app.use('/', routes);
+
+app.get('/', (_: Request, res: Response) => {
+  res.send('Hello, TypeScript + Node.js + Express!');
+});
+
+https.createServer(options, app).listen(port, () => {
+  console.log(`HTTPS server is running on port ${port}`);
+});
+
+
+=== ./public-server/src/api\controllers\nodeApnController.ts ===
+
+import apn from 'apn';
+import { Notification } from '../../entity/Notification';
+
+const keyPath = process.env.APN_KEY ?? '';
+const keyId = process.env.APN_KEY_ID ?? '';
+const teamId = process.env.APN_TEAM_ID ?? '';
+const bundleId = process.env.APN_BUNDLE_ID ?? '';
+
+const options = {
+  token: { key: keyPath, keyId: keyId, teamId: teamId },
+  production: process.env.NODE_ENV === 'production',
+};
+
+if (!options.token.key || !options.token.keyId || !options.token.teamId) {
+  throw new Error('One or more APN token fields are missing.');
+}
+
+const apnProvider = new apn.Provider(options);
+
+const sendNotification = async (
+  notification: Notification,
+  deviceToken: string,
+  num_of_unsigned_notif: number,
+) => {
+
+
+  if (notification && apnProvider) {
+    const notif = new apn.Notification({
+      alert: `${notification.sender}さんから${notification.subject}の承認依頼が届きました。`,
+      body: `${notification.sender}さんから${notification.subject}の承認依頼が届きました。`,
+      date: notification.date,
+      topic: bundleId,
+      badge: num_of_unsigned_notif,
+      payload: {
+        from: 'approveHub, using node-apn',
+        source: 'approveHub server',
+      },
+    });
+
+    await apnProvider.send(notif, deviceToken);
+  }
+};
+
+export default { sendNotification };
+
+
+=== ./public-server/src/api\controllers\webhookController.ts ===
+
+import { Request, Response } from 'express';
+import crypto from 'crypto';
+import { AxiosResponse } from 'axios';
+import { Notification } from '../../entity/Notification';
+import { User_Application } from '../../entity/User_Application';
+import nodeApnController from './nodeApnController';
+import { makeAxiosRequest } from '../utils/axiosRequest';
+
+console.log(process.env.DOCUSIGN_HMAC_TOKEN);
+
+const docusignNotification = async (req: Request, res: Response) => {
+  console.log('Received docusign notification');
+  const DOCUSIGN_ID: number = 1;
+  const FALSE_VALUE: number = 0;
+  const TRUE_VALUE: number = 1;
+
+  const computeHash = (payload: string, secret: string) => {
+    const hmac = crypto.createHmac('sha256', secret);
+    hmac.write(payload);
+    hmac.end();
+    return hmac.read().toString('base64');
+  };
+
+  const isHashValid = (payload: string, verify: string, secret: string) => {
+    return crypto.timingSafeEqual(
+      Buffer.from(verify, 'base64'),
+      Buffer.from(computeHash(payload, secret), 'base64'),
+    );
+  };
+
+  try {
+    const payload = req.body;
+    const verify = req.headers['x-docusign-signature-1']?.toString();
+    const secret = process.env.DOCUSIGN_HMAC_TOKEN?.toString();
+
+    if (!secret) {
+      res.status(500).send('DOCUSIGN_HMAC_TOKEN not found');
+      return;
+    } else if (!verify) {
+      res.status(500).send('x-docusign-signature-1 not found');
+      return;
+    }
+
+    const isHmacValid = isHashValid(JSON.stringify(payload), verify, secret);
+
+    if (!isHmacValid) {
+      res.status(500).send('Invalid key');
+      return;
+    }
+
+    const splitSubject = payload.data.envelopeSummary.emailSubject.split(': ');
+    const subject = splitSubject.length > 1 ? splitSubject[1] : payload.data.envelopeSummary.emailSubject;
+    const date = payload.generatedDateTime;
+    const sender =
+      payload.data.envelopeSummary.sender.userName ||
+      payload.data.envelopeSummary.sender.email;
+    const envelopeId = payload.data.envelopeId;
+
+    const recipients = payload.data.envelopeSummary.recipients.signers;
+    for (const recipient of recipients) {
+      const { email } = recipient;
+
+      const userApplication: AxiosResponse<User_Application> =
+        await makeAxiosRequest('userApplications/findByEmailAndAppId', 'post', {
+          email,
+          appId: DOCUSIGN_ID,
+        });
+
+      if (!userApplication.data) continue;
+
+      let userApplicationData = {
+        app: userApplication.data.app,
+        id: userApplication.data.id,
+        isLoggedIn: userApplication.data.is_logged_in,
+        numOfUnsignedNotif: userApplication.data.num_of_unsigned_notif,
+        user: userApplication.data.user,
+      };
+
+      let notification: Notification | null = null;
+
+      if (payload.event === 'envelope-sent') {
+        notification = new Notification(
+          subject,
+          date,
+          FALSE_VALUE,
+          FALSE_VALUE,
+          sender,
+          userApplicationData.user,
+          userApplicationData.app,
+          envelopeId,
+        );
+
+        await makeAxiosRequest('notifications/create', 'post', notification);
+
+        userApplicationData.numOfUnsignedNotif += 1;
+
+        try {
+          await nodeApnController.sendNotification(
+            notification,
+            userApplicationData.user.device_token,
+            userApplicationData.numOfUnsignedNotif,
+          );
+        } catch (error) {
+          throw new Error(
+            `Error sending APN notification: ${(error as Error).message}`,
+          );
+        }
+      } else if (payload.event === 'recipient-completed') {
+        const notificationResponse: AxiosResponse<Notification> =
+          await makeAxiosRequest(
+            'notifications/findByUserIdAndEnvelopeId',
+            'post',
+            {
+              userId: userApplicationData.user.id,
+              envelopeId,
+            },
+          );
+
+        if (!notificationResponse.data) continue;
+
+        let notificationData = {
+          app: notificationResponse.data.app,
+          date: notificationResponse.data.date,
+          envelope_id: notificationResponse.data.envelope_id,
+          id: notificationResponse.data.id,
+          isRead: notificationResponse.data.is_read,
+          isSigned: TRUE_VALUE,
+          receiver: notificationResponse.data.receiver,
+          sender: notificationResponse.data.sender,
+          subject: notificationResponse.data.subject,
+        };
+
+        const updatedNotification: AxiosResponse<Notification> =
+          await makeAxiosRequest(
+            `notifications/update/${notificationData.id}`,
+            'put',
+            notificationData,
+          );
+        notification = updatedNotification.data;
+
+        userApplicationData.numOfUnsignedNotif -= 1;
+      }
+
+      await makeAxiosRequest(
+        `userApplications/update/${userApplication.data.id}`,
+        'put',
+        userApplicationData,
+      );
+    }
+
+    res.status(200).send('Success');
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Error processing JSON from webhook: ${(error as Error).message}`);
+  }
+};
+
+export default {
+  docusignNotification,
+};
+
+
+=== ./public-server/src/api\routes\routes.ts ===
+
+import express, { Router } from 'express';
+import webhookRoutes from './webhookRoutes';
+
+const router: Router = express.Router();
+
+router.use('/webhooks', webhookRoutes);
+
+export default router;
+
+
+=== ./public-server/src/api\routes\webhookRoutes.ts ===
+
+import express, { Router } from 'express';
+import webhookController from '../controllers/webhookController';
+
+const router: Router = express.Router();
+
+router.post('/docusign', webhookController.docusignNotification);
+
+export default router;
+
+
+=== ./public-server/src/api\tests\webhookController.test.ts ===
+
+// import { describe, expect, test } from '@jest/globals';
+// import webhookController from '../controllers/webhookController';
+
+// describe('webhookController', () => {
+//   test('webhookTestAPI', () => {
+//     // expect(webhookController.webhookTestAPI).toBeDefined();
+//   });
+// });
+
+
+=== ./public-server/src/api\utils\axiosRequest.ts ===
+
+import axios, { AxiosResponse, AxiosRequestConfig } from 'axios';
+
+export async function makeAxiosRequest<T>(
+  url: string,
+  method: 'get' | 'post' | 'put',
+  data?: object,
+  config?: AxiosRequestConfig,
+): Promise<AxiosResponse<T>> {
+  const PRIVATE_URL = process.env.PRIVATE_URL || 'http://localhost';
+
+  try {
+    const response = await axios({
+      url: `${PRIVATE_URL}/${url}`,
+      method,
+      data,
+      ...config,
+    });
+    return response;
+  } catch (error) {
+    console.error('Error in axios request:', error);
+    throw error;
+  }
+}
+
+
+=== ./public-server/src/entity\Application.ts ===
+
+import { Entity, PrimaryGeneratedColumn, Column } from 'typeorm';
+
+@Entity()
+export class Application {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  app_name: string;
+
+  constructor(app_name: string) {
+    this.app_name = app_name;
+  }
+}
+
+
+=== ./public-server/src/entity\Notification.ts ===
+
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  ManyToOne,
+  JoinColumn,
+} from 'typeorm';
+import { User } from './User';
+import { Application } from './Application';
+
+@Entity()
+export class Notification {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  subject: string;
+
+  @Column()
+  date: string;
+
+  @Column()
+  is_read: number;
+
+  @Column()
+  is_signed: number;
+
+  @Column()
+  sender: string;
+
+  @ManyToOne(() => User)
+  @JoinColumn({ name: 'Receiver' })
+  receiver: User;
+
+  @ManyToOne(() => Application)
+  @JoinColumn({ name: 'App_Id' })
+  app: Application;
+
+  @Column()
+  envelope_id: string;
+
+  constructor(
+    subject: string,
+    date: string,
+    is_read: number,
+    is_signed: number,
+    sender: string,
+    receiver: User,
+    app: Application,
+    envelope_id: string,
+  ) {
+    this.subject = subject;
+    this.date = date;
+    this.is_read = is_read;
+    this.is_signed = is_signed;
+    this.sender = sender;
+    this.receiver = receiver;
+    this.app = app;
+    this.envelope_id = envelope_id;
+  }
+}
+
+
+=== ./public-server/src/entity\User.ts ===
+
+import { Entity, PrimaryGeneratedColumn, Column } from 'typeorm';
+
+@Entity()
+export class User {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column({ type: 'text', nullable: true })
+  email: string | null;
+
+  @Column()
+  device_token: string;
+
+  constructor(email: string | null = null, device_token: string) {
+    this.email = email;
+    this.device_token = device_token;
+  }
+}
+
+
+=== ./public-server/src/entity\User_Application.ts ===
+
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  ManyToOne,
+  JoinColumn,
+} from 'typeorm';
+import { Application } from './Application';
+import { User } from './User';
+
+@Entity()
+export class User_Application {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @ManyToOne(() => Application)
+  @JoinColumn({ name: 'App_Id' })
+  app: Application;
+
+  @ManyToOne(() => User)
+  @JoinColumn({ name: 'User_Id' })
+  user: User;
+
+  @Column()
+  num_of_unsigned_notif: number;
+
+  @Column()
+  is_logged_in: number;
+
+  constructor(
+    app: Application,
+    user: User,
+    num_of_unsigned_notif: number,
+    is_logged_in: number,
+  ) {
+    this.app = app;
+    this.user = user;
+    this.num_of_unsigned_notif = num_of_unsigned_notif;
+    this.is_logged_in = is_logged_in;
+  }
+}

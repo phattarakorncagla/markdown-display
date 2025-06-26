@@ -1,0 +1,2263 @@
+
+## Chunk 1
+# iPhone App Notification Specification Document
+
+## Overview
+This document details the API specification for the iPhone App Notification backend system. The system manages user authentication, application information, and notification synchronization for mobile applications. The backend uses Express.js with TypeORM to interface with an SQLite database.
+
+---
+
+## Authentication Flow
+The system uses the OAuth 2.0 PKCE flow for DocuSign integration:
+
+```mermaid
+sequenceDiagram
+    participant iPhone App
+    participant Backend
+    participant DocuSign Auth
+    iPhone App->>Backend: GET /auth/login/1 (with device-token header)
+    Backend->>iPhone App: 302 Redirect to DocuSign
+    iPhone App->>DocuSign Auth: User authentication
+    DocuSign Auth->>Backend: 302 Redirect to /docusign/login/success?code=...&state=...
+    Backend->>DocuSign: Exchange code for tokens
+    DocuSign-->>Backend: Access token
+    Backend->>DocuSign: Fetch user info/envelopes
+    Backend-->>iPhone App: Notification data response
+```
+
+---
+
+## API Endpoints
+
+### 1. Base Endpoint
+**GET /**  
+Returns a simple greeting message.
+
+**Response**  
+Status: `200 OK`  
+Body:
+```plaintext
+Hello, TypeScript + Node.js + Express!
+```
+
+---
+
+### 2. List Applications
+**GET /apps**  
+Retrieves all registered applications.
+
+**Response**  
+Status: `200 OK`  
+Body (application/json):
+```json
+[
+  {
+    "id": 1,
+    "app_name": "Docusign"
+  }
+]
+```
+
+**Error Cases**  
+- `500 Internal Server Error` with error message
+
+---
+
+### 3. Initiate Authentication
+**GET /auth/login/:appId**  
+Starts OAuth flow for the specified application.
+
+**Path Parameters**
+- `appId`: Application ID (currently only `1` for DocuSign supported)
+
+**Headers**
+- `device-token`: Unique identifier for the user's device
+
+**Response**  
+Status: `302 Found`  
+Redirects to DocuSign authentication URL
+
+**Error Cases**  
+- `400 Bad Request` for unsupported app IDs  
+- `500 Internal Server Error` if environment variables are missing
+
+---
+
+### 4. Authentication Callback
+**GET /docusign/login/success**  
+DocuSign OAuth callback endpoint (handles authorization code).
+
+**Query Parameters**
+- `code`: Authorization code from DocuSign
+- `state`: Device token (matches initial request)
+
+**Workflow**  
+1. Exchanges authorization code for access token  
+2. Fetches user info and envelopes from DocuSign  
+3. Creates/updates user in local database  
+4. Creates notification records  
+5. Updates user-application relationship  
+
+**Response**  
+Status: `200 OK`  
+Body: User notifications (application/json)
+
+**Error Cases**  
+- `400 Bad Request` if code/state missing  
+- `401 Unauthorized` if code verifier invalid  
+- `500 Internal Server Error` for token exchange failures  
+
+---
+
+## Data Models
+
+### User
+```typescript
+interface User {
+  id: number;
+  device_token: string;
+  email_hash: string; // SHA-256 hashed email
+  created_at: Date;
+}
+```
+
+### Notification
+```typescript
+interface Notification {
+  id: number;
+  user: User;
+  application: Application;
+  envelope_id: string;
+  status: 'completed' | 'pending';
+  subject: string;
+  last_update: Date;
+}
+```
+
+### Application
+```typescript
+interface Application {
+  id: number;
+  app_name: string;
+}
+```
+
+---
+
+## Security
+1. **Session Management**: Uses `express-session` with configurable production settings
+2. **PKCE Flow**: Prevents authorization code interception attacks
+3. **Data Encryption**:
+   - User emails stored as SHA-256 hashes
+   - Production cookies set with `secure` flag
+4. **Environment Variables**:
+   - `SESSION_SECRET`: Session encryption secret
+   - `DOCUSIGN_APP_INTEGRATION_KEY`: OAuth client ID
+   - `DOCUSIGN_PKCE_KEY`: Client secret for PKCE flow
+
+---
+
+## Error Handling
+Standard error responses include:
+```json
+{
+  "error": "Descriptive error message"
+}
+```
+Status codes indicate error categories:
+- `4xx`: Client-side errors
+- `5xx`: Server-side failures
+
+Logging includes detailed error information for debugging.
+
+---
+
+## Dependencies
+- **Runtime**: Node.js
+- **Database**: SQLite
+- **Libraries**: 
+  - Express.js (web framework)
+  - TypeORM (database ORM)
+  - crypto (encryption utilities)
+
+## Chunk 2
+### Specification Document: iPhone App Notification System
+
+---
+
+#### **Project Overview**  
+The iPhone App Notification System manages user authentication, device registration, and notification synchronization with integrated services like DocuSign. It synchronizes document envelopes as notifications and tracks signature status updates.  
+
+---
+
+#### **Endpoints**  
+
+##### **1. Create User**  
+*Registers a new user with device token and optional email.*  
+- **HTTP Method**: `POST /api/device`  
+- **Request Body**:  
+  ```json
+  {
+    "deviceToken": "string (required)",
+    "email": "string (optional)"
+  }
+  ```  
+- **Success Response (200)**:  
+  ```json
+  {
+    "id": 123,
+    "email": "hashed_value_or_null",
+    "deviceToken": "string"
+  }
+  ```  
+- **Error Cases**:  
+  - `400 Bad Request`: Missing `deviceToken` or existing user.  
+  - `500 Internal Server Error`: Server-side failures.  
+
+##### **2. Update User**  
+*Updates a user's device token or email.*  
+- **HTTP Method**: `PUT /api/device/:userId`  
+- **Request Body**:  
+  ```json
+  {
+    "deviceToken": "string (optional)",
+    "email": "string (optional)"
+  }
+  ```  
+- **Success Response (200)**:  
+  ```json
+  {
+    "id": 123,
+    "email": "hashed_value",
+    "deviceToken": "string"
+  }
+  ```  
+- **Error Cases**:  
+  - `404 Not Found`: Invalid `userId`.  
+  - `500 Internal Server Error`: Update failures.  
+
+##### **3. DocuSign Login Success**  
+*Handles OAuth callback after DocuSign login to sync user data and notifications.*  
+- **HTTP Method**: `GET /api/docusign/login/success`  
+- **Query Parameter**: `code` (OAuth authorization code).  
+- **Success Response (200)**:  
+  ```json
+  {
+    "user": { ... },
+    "message": "ログインに成功しました。"
+  }
+  ```  
+- **Error Cases**:  
+  - `500 Internal Server Error`: OAuth token exchange or data sync failures.  
+
+---
+
+#### **Key Data Flows**  
+
+##### **DocuSign Sync Process**  
+1. **Fetch User Info**:  
+   - Calls DocuSign's `/oauth/userinfo` to get account ID.  
+2. **Fetch Envelopes**:  
+   - Retrieves inbox envelopes from:  
+     ```
+     GET /restapi/v2.1/accounts/{accountId}/folders/inbox?from_date=2025-01-01
+     ```  
+3. **Process Envelopes**:  
+   - Converts envelopes into notifications. Tracks `is_signed` status.  
+4. **Update User App State**:  
+   - Counts unsigned notifications and updates login status.  
+
+##### **Notification Sync Logic**  
+```typescript
+// For each envelope:
+if (envelope.status === 'completed' && !existingNotification) {
+  createNewNotification(envelope);
+} else if (envelope.status === 'completed' && existingNotification) {
+  markNotificationAsSigned(existingNotification);
+}
+```
+
+##### **User-Application State**  
+- **`User_Application` Entity**:  
+  ```typescript
+  {
+    user: User,
+    application: Application,
+    num_of_unsigned_notif: number, // Unsigned notifications
+    is_logged_in: number // 0/1 boolean
+  }
+  ```  
+- Updated during DocuSign sync to reflect active sessions and pending actions.  
+
+---
+
+#### **Security & Privacy**  
+- **Email Handling**:  
+  User emails are hashed using `SHA-256` (or similar) before storage.  
+- **Token Management**:  
+  Device tokens are stored in plaintext; OAuth tokens are transient.  
+
+---
+
+#### **Limitations & Notes**  
+1. **Hardcoded Date in Envelope Fetch**:  
+   `from_date=2025-01-01` may limit envelope retrieval (adjust to dynamic past date).  
+2. **Notification Deduplication**:  
+   Uses `envelope_id` to avoid duplicate notifications.  
+3. **Error Handling**:  
+   DocuSign API errors are logged and forwarded to the client.  
+
+--- 
+
+#### **Dependencies**  
+- **External APIs**: DocuSign OAuth, UserInfo, and Envelope endpoints.  
+- **Internal Services**:  
+  `userService`, `notificationService`, `userApplicationService`.  
+
+This document outlines core workflows and API contracts. For implementation details, refer to source code annotations.
+
+## Chunk 3
+# iPhone App Notification Service API Specification
+
+## Overview
+This document describes the API endpoints for managing notifications and user-application associations in the iPhone App Notification system. The API allows clients to create, retrieve, and update notification records while managing relationships between users and applications.
+
+---
+
+## Base URL
+All endpoints are relative to the base URL:
+```
+https://api.example.com/v1
+```
+
+---
+
+## Notification Endpoints
+
+### 1. Create Notification
+Creates a new notification record.
+
+**Endpoint**  
+`POST /notifications`
+
+**Request Body**  
+```typescript
+{
+  // Notification data properties (exact structure depends on service implementation)
+}
+```
+
+**Success Response**  
+`200 OK` with created notification object
+
+**Error Responses**  
+- `500 Internal Server Error` with error message
+
+### 2. Get Notifications by User and App
+Retrieves all notifications for a specific user and application.
+
+**Endpoint**  
+`POST /notifications/findAllByUserIdAndAppId`  
+*Note: Uses POST due to request body requirements*
+
+**Request Body**  
+```typescript
+{
+  "userId": number,  // Required user ID
+  "appId": number    // Required application ID
+}
+```
+
+**Success Response**  
+`200 OK` with array of notification objects
+
+**Error Responses**  
+- `400 Bad Request` if missing required fields
+- `500 Internal Server Error` with error message
+
+### 3. Get Notification by User and Envelope
+Finds a specific notification using user ID and envelope ID.
+
+**Endpoint**  
+`POST /notifications/findByUserIdAndEnvelopeId`
+
+**Request Body**  
+```typescript
+{
+  "userId": number,      // Required user ID
+  "envelopeId": string   // Unique envelope identifier
+}
+```
+
+**Success Response**  
+`200 OK` with notification object
+
+**Error Responses**  
+- `400 Bad Request` if missing required fields
+- `500 Internal Server Error` with error message
+
+### 4. Get Unsigned Notification Count
+Retrieves count of unsigned notifications for a user-application pair.
+
+**Endpoint**  
+`POST /notifications/unsignedCount`
+
+**Request Body**  
+```typescript
+{
+  "userId": number,  // Required user ID
+  "appId": number    // Required application ID
+}
+```
+
+**Success Response**  
+`200 OK` with integer count  
+Example: `5`
+
+**Error Responses**  
+- `400 Bad Request` if missing required fields
+- `500 Internal Server Error` with error message
+
+### 5. Update Notification
+Updates read/signed status of a notification.
+
+**Endpoint**  
+`PUT /notifications/:id`
+
+**Path Parameters**  
+- `id`: Notification ID (number)
+
+**Request Body**  
+```typescript
+{
+  "isRead": boolean,   // Optional read status
+  "isSigned": boolean  // Optional signed status
+}
+```
+*At least one property required*
+
+**Success Response**  
+`200 OK` with updated notification object
+
+**Error Responses**  
+- `400 Bad Request` if missing parameters
+- `404 Not Found` if notification doesn't exist
+- `500 Internal Server Error` with error message
+
+---
+
+## User Application Endpoints
+
+### 1. Create User-Application Association
+Links a user to an application with initial settings.
+
+**Endpoint**  
+`POST /user-applications`
+
+**Request Body**  
+```typescript
+{
+  "appId": number,              // Required application ID
+  "userId": number,             // Required user ID
+  "numOfUnsignedNotif": number, // Initial unsigned notification count
+  "isLoggedIn": boolean         // Initial login status
+}
+```
+
+**Success Response**  
+`200 OK` with created association object
+
+**Error Responses**  
+- `400 Bad Request` for missing fields or duplicate association
+- `404 Not Found` if user/application doesn't exist
+- `500 Internal Server Error` with error message
+
+### 2. Get User Applications
+Retrieves all applications associated with a user.
+
+**Endpoint**  
+`GET /user-applications/user/:userId`
+
+**Path Parameters**  
+- `userId`: User ID (number)
+
+**Success Response**  
+`200 OK` with array of user-application associations
+
+**Error Response**  
+`500 Internal Server Error` with error message
+
+### 3. Find User Application by Email
+Finds application association using hashed email.
+
+**Endpoint**  
+`POST /user-applications/findByEmailAndAppId`
+
+**Request Body**  
+```typescript
+{
+  "email": string,  // User's email (will be hashed)
+  "appId": number   // Application ID
+}
+```
+
+**Success Response**  
+`200 OK` with user-application association object
+
+**Error Responses**  
+- `400 Bad Request` if missing required fields
+- `500 Internal Server Error` with error message
+
+### 4. Find User Application by ID
+Finds specific user-application association.
+
+**Endpoint**  
+`POST /user-applications/findByUserIdAndAppId`
+
+**Request Body**  
+```typescript
+{
+  "userId": number,  // User ID
+  "appId": number    // Application ID
+}
+```
+
+**Success Response**  
+`200 OK` with user-application association object
+
+**Error Responses**  
+- `400 Bad Request` if missing required fields
+- `500 Internal Server Error` with error message
+
+### 5. Update User-Application Association
+Modifies notification count or login status.
+
+**Endpoint**  
+`PUT /user-applications/:id`
+
+**Path Parameters**  
+- `id`: Association ID (number)
+
+**Request Body**  
+```typescript
+{
+  "numOfUnsignedNotif": number,  // Updated unsigned count
+  "isLoggedIn": boolean          // Updated login status
+}
+```
+*At least one property required*
+
+**Success Response**  
+`200 OK` with updated association object
+
+**Error Responses**  
+- `400 Bad Request` if missing parameters
+- `404 Not Found` if association doesn't exist
+- `500 Internal Server Error` with error message
+
+---
+
+## Best Practices
+1. **Validation**: Always validate required fields before sending requests
+2. **Error Handling**: Check for 400/404/500 status codes and handle appropriately
+3. **Security**: Use HTTPS for all requests
+4. **Idempotency**: PUT operations are idempotent - safe to retry on failures
+5. **Email Handling**: Emails are automatically hashed server-side
+
+## Notes
+- All ID parameters should be integers
+- Dates/timestamps use ISO 8601 format
+- Empty responses contain no body (status-only)
+- POST for queries is used when complex parameters are required
+
+## Chunk 4
+```markdown
+# iPhone App Notification System - API Specification
+
+## Introduction
+This document details the API specification for the iPhone App Notification system. The API enables:
+- User and device management
+- Mobile notification handling
+- Application configuration
+- Authentication workflows
+
+Base URL: `https://api.example.com/v1`
+
+---
+
+## User Endpoints
+
+### `GET /users`
+**List all users**  
+Fetches all registered users  
+*Response (success):*
+```json
+[
+  {
+    "id": 1,
+    "email": "encrypted_value",
+    "deviceToken": "device_token_value"
+  }
+]
+```
+
+### `GET /users/:id`
+**Get user by ID**  
+*Path Parameters:*  
+- `id` (integer): User ID  
+
+*Responses:*  
+- `200 OK`: Returns user object  
+- `404 Not Found`: User not found
+
+### `POST /users/findByDeviceToken`
+**Find user by device token**  
+*Body:*
+```json
+{
+  "deviceToken": "device_token_value"
+}
+```
+*Response (success):* User object or 404 if not found
+
+### `POST /users/findByEmail`
+**Find user by email**  
+*Body:*
+```json
+{
+  "email": "user@example.com"
+}
+```
+*Note:* Email is hashed before lookup  
+*Response:* User object or 404
+
+### `PUT /users/:id`
+**Update user information**  
+*Path Parameters:*  
+- `id` (integer): User ID  
+
+*Body:*
+```json
+{
+  "deviceToken": "new_device_token",
+  "email": "new_email@example.com"
+}
+```
+
+### `DELETE /users/:id`
+**Delete user**  
+*Path Parameters:*  
+- `id` (integer): User ID  
+*Response:* `"User deleted"`
+
+---
+
+## Notification Endpoints
+
+### `POST /notifications/create`
+**Create new notification**  
+*Body:*
+```json
+{
+  "subject": "Contract Update",
+  "date": "2023-09-15T10:00:00Z",
+  "isRead": 0,
+  "isSigned": 0,
+  "sender": "John Doe",
+  "receiver": 123,
+  "appId": 456,
+  "envelopeId": "env-789"
+}
+```
+
+### `POST /notifications/findByUserIdAndAppId`
+**Get user notifications for specific app**  
+*Body:*
+```json
+{
+  "userId": 123,
+  "appId": 456
+}
+```
+
+### `POST /notifications/findByUserIdAndEnvelopeId`
+**Find specific notification**  
+*Body:*
+```json
+{
+  "userId": 123,
+  "envelopeId": "env-789"
+}
+```
+
+### `POST /notifications/getUnsignedNotificationCount`
+**Count unsigned notifications**  
+*Body:*
+```json
+{
+  "userId": 123
+}
+```
+*Response:* Integer count
+
+### `PUT /notifications/:id`
+**Update notification status**  
+*Path Parameters:*  
+- `id` (integer): Notification ID  
+
+*Body:*
+```json
+{
+  "isRead": 1,
+  "isSigned": 1
+}
+```
+
+---
+
+## Device Management
+
+### `POST /devices/create`
+**Register new device**  
+*Body:* Device token payload  
+
+### `PUT /devices/update/:userId`
+**Update device token**  
+*Path Parameters:*  
+- `userId` (integer): User ID  
+*Body:* New device token  
+
+---
+
+## Application Management
+
+### `GET /apps`
+**List all applications**  
+*Response:* Array of application objects
+
+---
+
+## User Application Relationships
+
+### `POST /userApplications/create`
+**Link user to application**  
+*Body:*
+```json
+{
+  "appId": 456,
+  "userId": 123,
+  "numOfUnsignedNotif": 3,
+  "isLoggedIn": 1
+}
+```
+
+### `GET /userApplications/findByUserId/:userId`
+**Get user's applications**  
+*Path Parameters:*  
+- `userId` (integer): User ID  
+*Response:* Array of application links
+
+### `POST /userApplications/findByEmailAndAppId`
+**Find user-app link by email**  
+*Body:*
+```json
+{
+  "email": "user@example.com",
+  "appId": 456
+}
+```
+
+### `POST /userApplications/findByUserIdAndAppId`
+**Verify user-app relationship**  
+*Body:*
+```json
+{
+  "userId": 123,
+  "appId": 456
+}
+```
+
+### `PUT /userApplications/:id`
+**Update application link**  
+*Path Parameters:*  
+- `id` (integer): Link ID  
+*Body:*
+```json
+{
+  "numOfUnsignedNotif": 0,
+  "isLoggedIn": 0
+}
+```
+
+### `DELETE /userApplications/:id`
+**Remove user-application link**  
+*Path Parameters:*  
+- `id` (integer): Link ID  
+
+---
+
+## Authentication
+
+### `GET /login/:appId`
+**Initiate OAuth login**  
+*Path Parameters:*  
+- `appId` (integer): Application ID  
+
+### `GET /docusign/login/success`
+**OAuth callback endpoint**  
+Handles successful DocuSign authentication  
+
+---
+
+## Error Handling
+All endpoints return standardized errors:
+```json
+{
+  "error": "Descriptive message"
+}
+```
+Status codes:
+- `400` Bad Request
+- `404` Resource Not Found
+- `500` Internal Server Error
+```
+
+## Chunk 5
+# iPhone App Notification System - API Specification
+
+## Overview
+This document outlines the API specification for an iPhone notification system backend. The system manages users, applications, notifications, and associations between users and applications. It provides a RESTful interface for managing notification delivery and tracking.
+
+## User Endpoints
+
+### 1. Get All Users
+- **Endpoint**: `GET /users`
+- **Description**: Retrieves all registered users
+- **Response Format**: 
+  ```json
+  [
+    {
+      "id": 1,
+      "email": "user@example.com",
+      "device_token": "device-token-string"
+    }
+  ]
+  ```
+
+### 2. Get User by ID
+- **Endpoint**: `GET /users/:id`
+- **Description**: Retrieves a user by their unique ID
+- **Parameters**:
+  - `id` (path): User ID
+- **Response**: 
+  ```json
+  {
+    "id": 1,
+    "email": "user@example.com",
+    "device_token": "device-token-string"
+  }
+  ```
+
+### 3. Find User by Device Token
+- **Endpoint**: `POST /users/findByDeviceToken`
+- **Description**: Finds a user by their device token
+- **Request**:
+  ```json
+  {
+    "deviceToken": "device-token-string"
+  }
+  ```
+- **Response**: 
+  ```json
+  {
+    "id": 1,
+    "email": "user@example.com",
+    "device_token": "device-token-string"
+  }
+  ```
+
+### 4. Find User by Email
+- **Endpoint**: `POST /users/findByEmail`
+- **Description**: Finds a user by their email address
+- **Request**:
+  ```json
+  {
+    "email": "user@example.com"
+  }
+  ```
+- **Response**: 
+  ```json
+  {
+    "id": 1,
+    "email": "user@example.com",
+    "device_token": "device-token-string"
+  }
+  ```
+
+### 5. Delete User
+- **Endpoint**: `DELETE /users/delete/:id`
+- **Description**: Deletes a user by their ID
+- **Parameters**:
+  - `id` (path): User ID
+
+---
+
+## Application Endpoints
+
+### 1. Get All Applications
+- **Endpoint**: `GET /applications`
+- **Description**: Retrieves all registered applications
+- **Response**:
+  ```json
+  [
+    {
+      "id": 1,
+      "name": "Example App"
+    }
+  ]
+  ```
+
+### 2. Get Application by ID
+- **Endpoint**: `GET /applications/:id`
+- **Description**: Retrieves an application by its ID
+- **Parameters**:
+  - `id` (path): Application ID
+- **Response**:
+  ```json
+  {
+    "id": 1,
+    "name": "Example App"
+  }
+  ```
+
+---
+
+## Notification Endpoints
+
+### 1. Create Notification
+- **Endpoint**: `POST /notifications`
+- **Description**: Creates a new notification
+- **Request**:
+  ```json
+  {
+    "receiver_id": 1,
+    "app_id": 1,
+    "content": "New message",
+    "is_signed": false,
+    "envelope_id": "unique-envelope-id"
+  }
+  ```
+- **Response**: Created notification object
+
+### 2. Get Notification by ID
+- **Endpoint**: `GET /notifications/:id`
+- **Description**: Retrieves a notification by its ID
+- **Parameters**:
+  - `id` (path): Notification ID
+- **Response**:
+  ```json
+  {
+    "id": 1,
+    "receiver_id": 1,
+    "app_id": 1,
+    "content": "New message",
+    "is_signed": false,
+    "envelope_id": "unique-envelope-id"
+  }
+  ```
+
+### 3. Find Notifications by User and Envelope ID
+- **Endpoint**: `GET /notifications/findByUserAndEnvelope`
+- **Description**: Finds notifications by user ID and envelope ID
+- **Query Parameters**:
+  - `userId`: User ID
+  - `envelopeId`: Envelope ID
+- **Response**:
+  ```json
+  {
+    "id": 1,
+    "receiver_id": 1,
+    "app_id": 1,
+    "content": "New message",
+    "is_signed": false,
+    "envelope_id": "unique-envelope-id"
+  }
+  ```
+
+### 4. Get Notifications by User and App
+- **Endpoint**: `GET /notifications/findByUserAndApp`
+- **Description**: Retrieves all notifications for a user in a specific app
+- **Query Parameters**:
+  - `userId`: User ID
+  - `appId`: Application ID
+- **Response**:
+  ```json
+  [
+    {
+      "id": 1,
+      "receiver_id": 1,
+      "app_id": 1,
+      "content": "New message",
+      "is_signed": false,
+      "envelope_id": "unique-envelope-id"
+    }
+  ]
+  ```
+
+### 5. Get Unsigned Notification Count
+- **Endpoint**: `GET /notifications/unsignedCount`
+- **Description**: Gets count of unsigned notifications for a user/app
+- **Query Parameters**:
+  - `userId`: User ID
+  - `appId`: Application ID
+- **Response**:
+  ```json
+  {
+    "count": 5
+  }
+  ```
+
+### 6. Update Notification
+- **Endpoint**: `PUT /notifications/:id`
+- **Description**: Updates a notification
+- **Parameters**:
+  - `id` (path): Notification ID
+- **Request**: Partial notification object
+
+### 7. Delete Notification
+- **Endpoint**: `DELETE /notifications/:id`
+- **Description**: Deletes a notification by ID
+- **Parameters**:
+  - `id` (path): Notification ID
+
+---
+
+## User-Application Association Endpoints
+
+### 1. Create Association
+- **Endpoint**: `POST /user-applications`
+- **Description**: Creates a user-application association
+- **Request**:
+  ```json
+  {
+    "user_id": 1,
+    "app_id": 1
+  }
+  ```
+- **Response**: Created association object
+
+### 2. Get Association by ID
+- **Endpoint**: `GET /user-applications/:id`
+- **Description**: Retrieves association by ID
+- **Parameters**:
+  - `id` (path): Association ID
+- **Response**:
+  ```json
+  {
+    "id": 1,
+    "user_id": 1,
+    "app_id": 1
+  }
+  ```
+
+### 3. Find Associations by User
+- **Endpoint**: `GET /user-applications/findByUser`
+- **Description**: Retrieves all applications associated with a user
+- **Query Parameters**:
+  - `userId`: User ID
+- **Response**:
+  ```json
+  [
+    {
+      "id": 1,
+      "app": {
+        "id": 1,
+        "name": "Example App"
+      }
+    }
+  ]
+  ```
+
+### 4. Find Association by User and App
+- **Endpoint**: `GET /user-applications/findByUserAndApp`
+- **Description**: Finds a specific user-application association
+- **Query Parameters**:
+  - `userId`: User ID
+  - `appId`: Application ID
+- **Response**:
+  ```json
+  {
+    "id": 1,
+    "user_id": 1,
+    "app_id": 1
+  }
+  ```
+
+### 5. Find Association by Email and App
+- **Endpoint**: `GET /user-applications/findByEmailAndApp`
+- **Description**: Finds association by user email and application ID
+- **Query Parameters**:
+  - `email`: User email
+  - `appId`: Application ID
+- **Response**:
+  ```json
+  {
+    "id": 1,
+    "user_id": 1,
+    "app_id": 1
+  }
+  ```
+
+### 6. Update Association
+- **Endpoint**: `PUT /user-applications/:id`
+- **Description**: Updates a user-application association
+- **Parameters**:
+  - `id` (path): Association ID
+- **Request**: Partial association object
+
+### 7. Delete Association
+- **Endpoint**: `DELETE /user-applications/:id`
+- **Description**: Deletes a user-application association
+- **Parameters**:
+  - `id` (path): Association ID
+
+---
+
+## Key Entities
+- **User**: Represents an app user with device token and email
+- **Application**: Represents a mobile application
+- **Notification**: Represents a push notification sent to a user
+- **User_Application**: Association between users and applications
+
+## Chunk 6
+### Specification Document: iPhone App Notification System
+
+This document outlines the core API specifications for the iPhone App Notification System backend. The system handles application management and OAuth2-based authentication via Docusign.
+
+---
+
+#### **1. Application Management Endpoints**
+Manages application metadata stored in the database.
+
+##### **1.1 Get All Applications**
+- **Endpoint**: `GET /applications`  
+- **Response** (`200 OK`):  
+  ```json
+  [
+    {
+      "id": "mockApp1",
+      "name": "Application 1"
+    },
+    {
+      "id": "mockApp2",
+      "name": "Application 2"
+    }
+  ]
+  ```
+- **Error Handling** (`500 Internal Server Error`):  
+  ```text
+  Error getting apps: [error-message]
+  ```
+
+##### **1.2 Get Application by ID**
+- **Endpoint**: `GET /applications/:id`  
+- **Path Parameter**: `id` (application ID, e.g., `1`)  
+- **Response** (`200 OK`):  
+  ```json
+  {
+    "id": "mockApp1",
+    "name": "Application 1"
+  }
+  ```
+- **Error Handling**:  
+  - `404 Not Found` if application doesn’t exist (returns `null`).
+
+---
+
+#### **2. Authentication Endpoints**
+Handles OAuth2 login flow with Docusign for user authentication.
+
+##### **2.1 Initiate Docusign Login**
+- **Endpoint**: `GET /auth/login/:appId`  
+- **Path Parameter**: `appId` (application ID, e.g., `1`)  
+- **Headers**:  
+  ```http
+  device-token: [unique-device-identifier]
+  ```
+- **Process**:  
+  1. Validates `appId` and environment variables.  
+  2. Generates PKCE code challenge/verifier.  
+  3. Stores `codeVerifier` and `deviceToken` in the session.  
+  4. Redirects to Docusign’s OAuth endpoint.  
+
+- **Response**: `302 Redirect` to Docusign  
+  ```text
+  https://account-d.docusign.com/oauth/auth?response_type=code&client_id=[integration-key]...
+  ```
+- **Error Handling**:  
+  - `500 Internal Server Error`:  
+    ```text
+    Missing required environment variables
+    ```
+  - `400 Bad Request`:  
+    ```text
+    No login available for this app
+    ```
+
+##### **2.2 OAuth2 Callback**
+- **Endpoint**: `GET /auth/docusign/callback`  
+- **Query Parameters**:  
+  ```http
+  ?code=[authorization-code]
+  ```
+- **Process**:  
+  1. Exchanges `code` + `codeVerifier` (from session) for Docusign tokens.  
+  2. Validates `deviceToken` from session.  
+- **Success Response**:  
+  ```json
+  {
+    "access_token": "mock-access-token",
+    "refresh_token": "mock-refresh-token"
+  }
+  ```
+- **Error Handling**:  
+  - `400 Bad Request`:  
+    - `No auth code provided`  
+    - `No device token found`  
+
+---
+
+#### **Key Requirements**
+1. **Environment Variables**:  
+   - `DOCUSIGN_APP_INTEGRATION_KEY`: Docusign client ID.  
+   - `DOCUSIGN_REDIRECT_URI`: OAuth callback URL.  
+   - `ENCRYPTION_KEY`: Encrypts sensitive session data.  
+   - `DOCUSIGN_PKCE_KEY`: PKCE secret (optional).  
+
+2. **Session Management**:  
+   - Stores `codeVerifier` and `deviceToken` during OAuth flow.  
+   - Sessions are critical for maintaining state between redirects.
+
+3. **Security**:  
+   - PKCE (Proof Key for Code Exchange) ensures OAuth security.  
+   - `device-token` header ties authentication to a specific device.  
+
+---
+
+#### **Error Patterns**
+- **5xx Errors**: Server-side issues (e.g., DB failures, missing config).  
+- **4xx Errors**: Client-side issues (e.g., invalid `appId`, missing tokens).  
+- Responses include human-readable error messages for debugging.  
+
+Example error response:  
+```http
+HTTP/1.1 500 Internal Server Error
+Error getting apps: Database connection failed
+```
+
+This specification ensures consistent integration between the iPhone app and backend services. For implementation details, refer to the source code and test cases.
+
+## Chunk 7
+```markdown
+# iPhone Notification App - API Specification
+
+## Overview
+This document describes the backend API specifications for the iPhone Notification App. The API handles device registration and DocuSign OAuth integration to enable notification workflows.
+
+---
+
+## 1. Device Management Endpoints
+
+### Create New Device Registration
+**Endpoint**: `POST /device`  
+Registers a new device and user for notifications.
+
+**Request Body**:
+```json
+{
+  "email": "user@example.com",
+  "deviceToken": "your_device_token"
+}
+```
+
+**Success Response** (200 OK):
+```json
+{
+  "id": 123,
+  "email": "user@example.com",
+  "deviceToken": "your_device_token"
+}
+```
+
+**Error Cases**:
+- `400 Bad Request`: Missing deviceToken  
+  Response: `"Missing deviceToken"`
+- `500 Internal Server Error`: Creation failure  
+  Response: `"Error creating user: [error details]"`
+
+---
+
+### Update Device Registration
+**Endpoint**: `PUT /device/:userId`  
+Updates an existing device registration.
+
+**Path Parameters**:
+- `userId` (integer): ID of the user to update
+
+**Request Body**:
+```json
+{
+  "email": "updated@example.com",
+  "deviceToken": "new_device_token"
+}
+```
+
+**Success Response** (200 OK):
+```json
+{
+  "id": 123,
+  "email": "updated@example.com",
+  "deviceToken": "new_device_token"
+}
+```
+
+**Error Cases**:
+- `404 Not Found`: User doesn't exist  
+  Response: `"User not found"`
+- `500 Internal Server Error`: Update failure  
+  Response: `[error details]`
+
+---
+
+## 2. DocuSign Authentication Endpoint
+
+### OAuth Success Callback
+**Endpoint**: `GET /auth/docusign/callback`  
+Handles successful DocuSign OAuth logins and processes notifications.
+
+**Requirements**:
+- Valid `codeVerifier` must exist in session storage
+- Requires OAuth `code` parameter from DocuSign redirect (handled internally)
+
+**Success Response** (200 OK):  
+`"ログインに成功しました。"` (Japanese for "Login successful")
+
+**Error Cases**:
+- `500 Internal Server Error`:  
+  - Missing code verifier: `"No code verifier found"`  
+  - Token exchange failure: `"Error getting access token: [error details]"`  
+  - User not found: `"Error getting access token: User not found"`  
+  - Processing error: `"Error getting access token: [error message]"`
+
+---
+
+## Technical Notes
+- **Session Requirements**: DocuSign callback requires `codeVerifier` stored in session
+- **Data Flow**:
+  1. Exchanges authorization code for access/refresh tokens
+  2. Retrieves user info and envelope data from DocuSign
+  3. Creates/updates notifications
+  4. Updates user application status
+- **Security**: All user emails are encrypted at rest using AES-256 encryption
+```
+
+## Chunk 8
+# Notification Service API Specification
+
+## Overview
+This specification describes the Notification Service API for the iPhone App Notification project. The API enables management and retrieval of notifications including creating new notifications, updating read status, and querying notifications by various criteria. All endpoints return JSON responses.
+
+---
+
+## Endpoints
+
+### 1. Create Notification
+**HTTP Method**: `POST`  
+**Endpoint**: `/notifications`  
+Creates a new notification record.
+
+**Request Body**:
+```json
+{
+  "title": "Notification title",
+  "date": "ISO-8601 date string",
+  "isRead": 0,
+  "isDeleted": 0,
+  "sender": "sender name",
+  "user": { ... },
+  "application": { ... },
+  "envelopeId": "unique-envelope-id"
+}
+```
+
+**Success Response** (200 OK):
+```json
+{
+  "id": 123,
+  "title": "Notification title",
+  ... // Full notification object
+}
+```
+
+**Error Responses**:
+- `500 Internal Server Error`: On creation failure  
+  ```text
+  Error creating notification: [error details]
+  ```
+
+---
+
+### 2. List Notifications by User and Application
+**HTTP Method**: `POST`  
+**Endpoint**: `/notifications/findByUserIdAndAppId`  
+Retrieves notifications for a specific user and application.
+
+**Request Body**:
+```json
+{
+  "userId": 123,
+  "appId": 456
+}
+```
+
+**Success Response** (200 OK):
+```json
+[
+  {
+    "id": 1,
+    "title": "Notification 1",
+    ...
+  },
+  {
+    "id": 2,
+    "title": "Notification 2",
+    ...
+  }
+]
+```
+
+**Error Responses**:
+- `400 Bad Request`: Missing required fields  
+  ```text
+  Missing required fields
+  ```
+- `500 Internal Server Error`: On query failure  
+  ```text
+  Error getting notifications: [error details]
+  ```
+
+---
+
+### 3. Update Notification Read Status
+**HTTP Method**: `PUT`  
+**Endpoint**: `/notifications/{id}`  
+Updates the read status of a specific notification.
+
+**Path Parameters**:
+- `id` (required): Notification ID to update
+
+**Request Body**:
+```json
+{
+  "isRead": 1
+}
+```
+
+**Success Response** (200 OK):  
+Returns updated notification object
+```json
+{
+  "id": 123,
+  "isRead": 1,
+  ... // Other notification fields
+}
+```
+
+**Error Responses**:
+- `400 Bad Request`: Missing required fields  
+  ```text
+  Missing required fields
+  ```
+- `404 Not Found`: Notification not found  
+  ```text
+  Notification not found
+  ```
+- `500 Internal Server Error`: On update failure  
+  ```text
+  Error updating notification: [error details]
+  ```
+
+---
+
+### 4. Find Notifications by User and Envelope
+**HTTP Method**: `POST`  
+**Endpoint**: `/notifications/findByUserIdAndEnvelopeId`  
+Retrieves notifications by user ID and envelope ID.
+
+**Request Body**:
+```json
+{
+  "userId": 123,
+  "envelopeId": "envelope-123"
+}
+```
+
+**Success Response** (200 OK):  
+Array of matching notifications
+```json
+[...] // Notification objects
+```
+
+**Error Responses**:
+- `400 Bad Request`: Missing required fields  
+  ```text
+  Missing required fields
+  ```
+- `500 Internal Server Error`: On query failure  
+  *(Error message format matches other endpoints)*
+
+---
+
+## Data Types
+### Notification Object
+```ts
+{
+  id: number
+  title: string
+  date: string // ISO-8601 format
+  isRead: number // 0 = unread, 1 = read
+  isDeleted: number // 0 = active, 1 = deleted
+  sender: string
+  user: User
+  application: Application
+  envelopeId: string
+}
+```
+
+### User Object
+```ts
+{
+  email: string
+  deviceToken: string
+  ... // Other user properties
+}
+```
+
+### Application Object
+```ts
+{
+  id: number
+  name: string
+  ... // Other application properties
+}
+```
+
+---
+
+## Error Handling
+All endpoints follow consistent error handling:
+- Client errors (4xx) return plain text messages
+- Server errors (5xx) return error details in plain text
+- Validation errors return `400 Bad Request` with specific missing field messages
+- Object-not-found errors return `404 Not Found`
+
+> **Note**: Authorization mechanisms are not shown in current implementation but should be added for production use.
+
+## Chunk 9
+# iPhone App Notification Service - API Specification
+
+## Overview
+This document details the API endpoints for the iPhone App Notification service. The service manages notification-related operations including retrieving notifications and counting unsigned notifications. All endpoints expect JSON-formatted request bodies and return JSON responses.
+
+---
+
+## Endpoints
+
+### 1. Get Notification by User and Envelope ID
+**Description**: Retrieves a notification for a specific user and envelope ID  
+**HTTP Method**: `POST`  
+**Endpoint**: `/api/notification`  
+
+**Request Format**:
+```json
+{
+  "userId": 1,
+  "envelopeId": "mockNotif1"
+}
+```
+
+**Parameters**:
+- `userId` (integer, required): User identifier
+- `envelopeId` (string, required): Envelope identifier
+
+**Success Response** (200 OK):
+```json
+{
+  "id": 1,
+  "title": "Mock notif 1",
+  "date": "2023-01-01",
+  "isSigned": 0,
+  "expiry": 0,
+  "recipient": "tester",
+  "user": {
+    "email": "tester@testmail.test",
+    "deviceToken": "mocked-device-token"
+  },
+  "application": {
+    "id": 1,
+    "name": "mocked-app"
+  },
+  "envelope_id": "mockNotif1"
+}
+```
+
+**Error Responses**:
+- 400 Bad Request (missing parameters):
+  ```text
+  Missing required fields
+  ```
+- 500 Internal Server Error:
+  ```text
+  Error getting notification: [error details]
+  ```
+
+---
+
+### 2. Get Unsigned Notification Count
+**Description**: Returns the count of unsigned notifications for a user/app combination  
+**HTTP Method**: `POST`  
+**Endpoint**: `/api/notification/count`  
+
+**Request Format**:
+```json
+{
+  "userId": 1,
+  "appId": 1
+}
+```
+
+**Parameters**:
+- `userId` (integer, required): User identifier
+- `appId` (integer, required): Application identifier
+
+**Success Response** (200 OK):
+```json
+12
+```
+
+**Error Responses**:
+- 400 Bad Request (missing parameters):
+  ```text
+  Missing required fields
+  ```
+- 500 Internal Server Error:
+  ```text
+  Error getting notification count: [error details]
+  ```
+
+---
+
+## Key Notes
+1. **Authentication**: Endpoints require valid user credentials (implementation details not shown in sample)
+2. **Error Handling**: All errors include descriptive messages in response bodies
+3. **Validation**: Requests are validated for required parameters before processing
+4. **Idempotency**: Both endpoints are read-only and safe for multiple identical requests
+
+For implementation details and testing examples, refer to the `notificationController.test.ts` and `notificationService.test.ts` source files.
+
+## Chunk 10
+# iPhone App Notification System - Specification Document
+
+## Overview
+This document provides specifications for the iPhone App Notification System, covering key API endpoints for managing notifications and user-application relationships. The system enables:
+- Notification management (update/delete)
+- User-application association tracking
+- Notification status updates
+
+---
+
+## Notification Endpoints
+
+### 1. Update Notification
+**Endpoint**  
+`PUT /notifications`
+
+**Description**  
+Updates an existing notification and returns the modified notification object.
+
+**Request Format**  
+```typescript
+Notification {
+  title: string
+  type: string
+  status: number
+  priority: number
+  sender: string
+  user: User
+  application: Application
+  id: string
+}
+```
+
+**Response**  
+- Success: `200 OK` with updated Notification object
+- Error: `500 Internal Server Error` with error message
+
+**Example Request**
+```json
+{
+  "title": "Urgent Update",
+  "type": "priority",
+  "status": 1,
+  "priority": 2,
+  "sender": "system",
+  "user": {"email": "user@example.com"},
+  "application": {"name": "ExampleApp"},
+  "id": "notif123"
+}
+```
+
+**Example Response**
+```json
+{
+  "title": "Urgent Update",
+  "type": "priority",
+  "status": 1,
+  "priority": 2,
+  "sender": "system",
+  "user": {"email": "user@example.com"},
+  "application": {"name": "ExampleApp"},
+  "id": "notif123"
+}
+```
+
+---
+
+### 2. Delete Notification by ID
+**Endpoint**  
+`DELETE /notifications/:id`
+
+**Description**  
+Permanently removes a notification using its unique identifier.
+
+**Parameters**  
+- `id` (path parameter): Notification ID to delete
+
+**Response**  
+- Success: `200 OK` with no content
+- Error: `500 Internal Server Error` with error message
+
+**Example Request**
+```
+DELETE /notifications/notif123
+```
+
+---
+
+## User Application Endpoints
+
+### 1. Create User-Application Association
+**Endpoint**  
+`POST /user-applications`
+
+**Description**  
+Creates a new association between a user and an application.
+
+**Request Format**
+```json
+{
+  "appId": "string",
+  "userId": "string",
+  "numOfUnsignedNotif": number,
+  "isLoggedIn": boolean
+}
+```
+
+**Response Codes**
+- Success: `200 OK` with created User_Application object
+- `400 Bad Request`: Missing parameters or duplicate association
+- `404 Not Found`: User or application doesn't exist
+- `500 Internal Server Error`: Server error
+
+**Example Request**
+```json
+{
+  "appId": "app123",
+  "userId": "user456",
+  "numOfUnsignedNotif": 3,
+  "isLoggedIn": true
+}
+```
+
+**Example Response**
+```json
+{
+  "id": 789,
+  "application": {"name": "ExampleApp"},
+  "user": {"email": "user@example.com"},
+  "numOfUnsignedNotif": 3,
+  "isLoggedIn": true
+}
+```
+
+---
+
+### 2. Get Applications by User ID
+**Endpoint**  
+`GET /user-applications/user/:userId`
+
+**Description**  
+Retrieves all application associations for a specific user.
+
+**Parameters**  
+- `userId` (path parameter): User's unique identifier
+
+**Response**  
+- Success: `200 OK` with User_Application object(s)
+- Error: `500 Internal Server Error` with error message
+
+**Example Request**
+```
+GET /user-applications/user/user456
+```
+
+**Example Response**
+```json
+{
+  "id": 789,
+  "application": {"name": "ExampleApp"},
+  "user": {"email": "user@example.com"},
+  "numOfUnsignedNotif": 3,
+  "isLoggedIn": true
+}
+```
+
+---
+
+### 3. Update User-Application Status
+**Endpoint**  
+`PUT /user-applications/:id`
+
+**Description**  
+Updates notification status and login state for a user-application association.
+
+**Parameters**  
+- `id` (path parameter): Association ID to update
+
+**Request Format**
+```json
+{
+  "numOfUnsignedNotif": number,
+  "isLoggedIn": boolean
+}
+```
+
+**Example Request**
+```json
+{
+  "numOfUnsignedNotif": 0,
+  "isLoggedIn": false
+}
+```
+
+---
+
+## Key Entities
+```typescript
+class User {
+  email: string
+  deviceToken: string
+}
+
+class Application {
+  name: string
+}
+
+class User_Application {
+  application: Application
+  user: User
+  numOfUnsignedNotif: number
+  isLoggedIn: boolean
+}
+
+class Notification {
+  title: string
+  type: string
+  status: number
+  priority: number
+  sender: string
+  user: User
+  application: Application
+  id: string
+}
+```
+
+---
+
+## Error Handling
+Standard HTTP status codes are returned with meaningful messages:
+- `4xx`: Client-side errors (invalid requests, missing parameters)
+- `5xx`: Server-side processing errors
+- All errors include human-readable messages in the response body
+
+> **Note:** This specification covers core functionality based on implemented tests. Additional endpoints may exist for full system operations.
+
+## Chunk 11
+# iPhone App Notification System - User Application API Specification
+
+## Overview
+This API manages user-application relationships for an iPhone notification system, handling associations between users and applications while tracking notification statuses. The system allows creating, updating, deleting, and querying user-application relationships with robust error handling.
+
+---
+
+## Endpoints
+
+### 1. Create User Application
+**POST** `/user-applications`  
+Creates a new user-application relationship. Creates a new user if email doesn't exist.
+
+**Request Body:**
+```json
+{
+  "email": "user@example.com",
+  "app_name": "ExampleApp",
+  "device_token": "device-token-string"
+}
+```
+
+**Success Response (200 OK):**
+```json
+{
+  "application": { "name": "ExampleApp" },
+  "user": {
+    "email": "user@example.com",
+    "device_token": "device-token-string"
+  },
+  "num_of_unsigned_notif": 0
+}
+```
+
+**Error Responses:**  
+- `400 Bad Request`: Missing required fields  
+- `500 Internal Server Error`: Error creating user application  
+
+---
+
+### 2. Update User Application
+**PUT** `/user-applications/:id`  
+Updates the unsigned notification count for a user-application relationship.
+
+**Path Parameter:**
+- `id`: User application ID (integer)
+
+**Request Body:**
+```json
+{
+  "num_of_unsigned_notif": 5
+}
+```
+
+**Success Response (200 OK):**  
+Updated User_Application object
+
+**Error Responses:**  
+- `400 Bad Request`: Missing ID parameter  
+- `404 Not Found`: User application not found  
+- `500 Internal Server Error`: Error updating user application  
+
+---
+
+### 3. Delete User Application
+**DELETE** `/user-applications/:id`  
+Deletes a user-application relationship.
+
+**Path Parameter:**
+- `id`: User application ID (integer)
+
+**Success Response (200 OK):**  
+`"User application deleted"`
+
+**Error Response:**  
+- `500 Internal Server Error`: Error deleting user application  
+
+---
+
+### 4. Find by Email and App ID
+**POST** `/user-applications/findByEmailAndAppId`  
+Finds a user-application relationship by email and application ID.
+
+**Request Body:**
+```json
+{
+  "email": "user@example.com",
+  "appId": 123
+}
+```
+
+**Success Response (200 OK):**  
+User_Application object
+
+**Error Responses:**  
+- `400 Bad Request`: Missing email or appId  
+- `500 Internal Server Error`: Error retrieving user application  
+
+---
+
+### 5. Find by User ID and App ID
+**POST** `/user-applications/findByUserIdAndAppId`  
+Finds a user-application relationship by user ID and application ID.
+
+**Request Body:**
+```json
+{
+  "userId": 456,
+  "appId": 123
+}
+```
+
+**Success Response (200 OK):**  
+User_Application object
+
+**Error Responses:**  
+- `400 Bad Request`: Missing userId or appId  
+- `500 Internal Server Error`: Error retrieving user application  
+
+---
+
+## Data Models
+
+### User_Application
+```typescript
+class User_Application {
+  application: Application;
+  user: User;
+  num_of_unsigned_notif: number;
+  sign_notif_count: number;
+}
+```
+
+### Application
+```typescript
+class Application {
+  name: string;
+}
+```
+
+### User
+```typescript
+class User {
+  email: string;
+  device_token: string;
+}
+```
+
+---
+
+## Error Handling
+All endpoints follow consistent error handling:
+- 4xx errors for client issues (missing parameters, invalid requests)
+- 5xx errors for server-side issues
+- Detailed error messages in response body
+- Error format: `Error [operation]: [specific error message]`
+
+Example error response:
+```text
+Error updating user application: Database connection failed
+```
+
+---
+
+## Security
+- Requires valid `ENCRYPTION_KEY` environment variable for operations involving sensitive data
+- Input validation for all parameters
+- Parameter sanitization to prevent injection attacks
+
+## Chunk 12
+# iPhone App Notification System Specification
+
+## Overview
+This document specifies the API endpoints and core functionality for the iPhone App Notification System. The system manages users, applications, and their notification settings through a RESTful API. All endpoints return JSON responses unless otherwise specified.
+
+## API Endpoints
+
+### User Management
+
+#### Get All Users
+Retrieves all registered users in the system.
+
+- **Method**: `GET`
+- **Path**: `/users`
+- **Request**: None
+- **Response**:
+  - Status: `200 OK`
+  - Body: Array of User objects
+  ```json
+  [
+    {
+      "email": "user1@example.com",
+      "deviceToken": "device-token-abc123"
+    },
+    {
+      "email": "user2@example.com",
+      "deviceToken": "device-token-xyz789"
+    }
+  ]
+  ```
+- **Errors**:
+  - `500 Internal Server Error`: When unexpected server error occurs
+
+#### Get User by ID
+Retrieves a specific user by their unique identifier.
+
+- **Method**: `GET`
+- **Path**: `/users/:id`
+- **Parameters**:
+  - `id` (path): Numeric user ID (required)
+- **Response**:
+  - Status: `200 OK`
+  - Body: User object
+  ```json
+  {
+    "email": "user@example.com",
+    "deviceToken": "device-token-abc123"
+  }
+  ```
+- **Errors**:
+  - `404 Not Found`: When user doesn't exist
+  - `500 Internal Server Error`: When unexpected server error occurs
+
+---
+
+### User-Application Relationships
+Manage associations between users and applications with notification preferences.
+
+#### Create User-Application Relationship
+Creates a new relationship between a user and an application.
+
+- **Method**: `POST`
+- **Path**: `/user-applications`
+- **Request**:
+  ```json
+  {
+    "application": "App Name",
+    "user": "user@example.com",
+    "notificationPreference": 3,
+    "status": 0
+  }
+  ```
+- **Response**:
+  - Status: `201 Created`
+  - Body: Created UserApplication object
+  ```json
+  {
+    "id": 123,
+    "application": "App Name",
+    "user": "user@example.com",
+    "notificationPreference": 3,
+    "status": 0
+  }
+  ```
+
+#### Get User-Application by ID
+Retrieves a specific relationship by its ID.
+
+- **Method**: `GET`
+- **Path**: `/user-applications/:id`
+- **Parameters**:
+  - `id` (path): Numeric relationship ID (required)
+- **Response**:
+  - Status: `200 OK`
+  - Body: UserApplication object
+
+#### Find by Email and App ID
+Finds relationships by user email and application ID.
+
+- **Method**: `GET`
+- **Path**: `/user-applications`
+- **Query Parameters**:
+  - `email`: User's email
+  - `appId`: Application ID
+- **Response**:
+  - Status: `200 OK`
+  - Body: UserApplication object
+
+#### Update User-Application
+Updates an existing user-application relationship.
+
+- **Method**: `PUT`
+- **Path**: `/user-applications/:id`
+- **Request**:
+  ```json
+  {
+    "notificationPreference": 2,
+    "status": 1
+  }
+  ```
+- **Response**:
+  - Status: `200 OK`
+  - Body: Updated UserApplication object
+
+#### Delete User-Application Relationship
+Removes a relationship between a user and application.
+
+- **Method**: `DELETE`
+- **Path**: `/user-applications/:id`
+- **Parameters**:
+  - `id` (path): Numeric relationship ID (required)
+- **Response**:
+  - Status: `204 No Content`
+
+---
+
+## Core Models
+
+### User
+```typescript
+class User {
+  id?: number;
+  email: string;
+  deviceToken: string;
+}
+```
+
+### Application
+```typescript
+class Application {
+  id: number;
+  name: string;
+}
+```
+
+### UserApplication
+```typescript
+class User_Application {
+  id?: number;
+  application: Application;
+  user: User;
+  notificationPreference: number; // 0-3 scale
+  status: number; // 0=inactive, 1=active
+}
+```
+
+## Error Handling
+All errors follow this standardized format:
+```json
+{
+  "error": "Descriptive error message",
+  "details": "Additional context when available"
+}
+```
+
+## Security
+- All endpoints require authentication (implementation details TBD)
+- Device tokens must be encrypted at rest
+- Email addresses are hashed in storage using SHA-256
+
+## Chunk 13
+[Error]: Error code: 401 - {'error': {'message': 'No auth credentials found', 'code': 401}}
+
+## Chunk 14
+[Error]: Error code: 401 - {'error': {'message': 'No auth credentials found', 'code': 401}}
+
+## Chunk 15
+[Error]: Error code: 401 - {'error': {'message': 'No auth credentials found', 'code': 401}}
